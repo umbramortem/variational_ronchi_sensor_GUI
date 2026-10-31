@@ -10,7 +10,8 @@ from scipy.optimize import brentq
 from scipy.interpolate import griddata
 from scipy.spatial import cKDTree, ConvexHull
 from scipy.interpolate import RegularGridInterpolator
-from scipy.integrate import cumulative_trapezoid
+import scipy.sparse as sparse
+from scipy.sparse.linalg import spsolve
 from scipy.special import eval_jacobi
 from scipy.io import savemat
 from numpy.polynomial import legendre as npleg
@@ -24,6 +25,28 @@ import os
 import time
 
 # ══════════════════════════════════════════════════════════════════════════════
+# REFERENCES used in the comments of this code (in the texts shown by the GUI they are
+# written as "manuscript" and "Supplemental Document")
+#   [M]     J. Arriaga Hernández, B. Cuevas Otahola, A. Jaramillo Núñez, F. Sánchez-Mora,
+#           D. Gale, E. Benítez, A. Pozos Rojas, J. C. Cuevas-Tello, "Autonomous
+#           Wavefront Reconstruction from SLM-Based Ronchigrams Using a Regularized
+#           Variational Model", manuscript (2026).
+#   [S]     Same authors, "Autonomous Wavefront Reconstruction from SLM-Based
+#           Ronchigrams Using a Regularized Variational Model: Supplemental Document"
+#           (2026). Its equations are numbered S1, S2, ...
+#   [APB]   J. Arriaga Hernández, B. Cuevas Otahola, A. Jaramillo Núñez,
+#           J. Oliveros Oliveros, M. Morín Castillo, "Gaussian quadrature to solve the
+#           wavefront in simultaneous Hartmann/Bi-Ronchi tests with SLM using directional
+#           derivative", Appl. Phys. B 132, 14 (2026). doi:10.1007/s00340-025-08611-y
+#   [Optik] J. Arriaga Hernández, B. Cuevas Otahola, A. Diaz Nayotl, A. Jaramillo Núñez,
+#           A. Pérez Villegas, O. Valenzuela, "Machine learning K-means algorithm applied
+#           to wavefront sensing in Bi-Ronchi/Hartmann tests with SLM", Optik 346,
+#           172607 (2026). doi:10.1016/j.ijleo.2025.172607
+#   [OST]   A. Cornejo-Rodríguez, "Ronchi Test", Ch. 9 in D. Malacara (ed.), Optical Shop
+#           Testing, 3rd ed., John Wiley & Sons (2007).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PARAMETERS
 # ══════════════════════════════════════════════════════════════════════════════
 # Vertical alignment verification
@@ -31,6 +54,11 @@ ANGLE_THRESHOLD   = 0.01   # max residual inclination accepted (degrees). The Ho
                            # is only a first estimate: with curved fringes (e.g. spherical
                            # aberration) it can be off by ~0.5 deg, so the line fit refines it
 ALIGN_MAX_ITER    = 5      # max number of correction iterations
+ALIGN_MAX_CORRECTION = 3.0  # degrees. The verification only refines the coarse (Hough or
+                           # gradient) orientation, which is already accepted only when
+                           # Hough and the gradient agree within 3°. A measured residual,
+                           # or a total correction, larger than this means the measurement
+                           # is wrong (e.g. a fringe confused with an edge): it is rejected
 ALIGN_N_CENTRAL   = 3      # number of central stripes used to check verticality
 
 # Stripe segmentation
@@ -73,9 +101,10 @@ MIN_MANUAL_ANCHORS = 3     # anchor points needed per fringe in the fringe revie
 EDGE_TOL = 0.015           # a fringe row ending closer than this fraction of the pupil radius
                            # (at least 3 px) to the pupil border is cut by the pupil
 TA_POSITION = "experimental"   # where each TA value is located in the pupil:
-                           # "experimental" = on the measured fringe (Optical Shop Testing,
-                           # Eq. 9.30: m and m0 are compared at the same point (x, y));
-                           # "theoretical" = on the theoretical line (previous versions)
+                           # "experimental" = on the measured fringe node ([S] Eqs. S6,
+                           # S9; [OST] Eq. 9.30: m and m0 are compared at the same point);
+                           # "theoretical" = on the nominal line ([M] Eq. 14, previous
+                           # versions of the GUI)
 EDGE_PARTIAL = 0.35        # a fringe next to the pupil border narrower than this fraction of
                            # its neighbour is only the visible part of a cut fringe
 EDGE_MIN_ROWS = 5          # rows not cut by the pupil needed to measure the fringe width
@@ -86,7 +115,7 @@ POINT_STEP  = 5            # distance (px) between consecutive points of a centr
 REFINE_K1     = 5          # points inserted between neighbouring lines in the 1st refinement
 REFINE_K2     = 10         # points inserted between neighbouring lines in the 2nd refinement
 MIN_SPACING   = 1          # refined points are never closer than this (px).
-                           # >= 1 so there are never more points than pixels (Optik article)
+                           # >= 1 so there are never more points than pixels ([Optik] PCM)
 INTERP_METHOD = "linear"   # vertical/horizontal: "linear" = multilinear (Delaunay),
                            #                      "cubic" = spline (Clough-Tocher)
 GRID_INTERP_METHOD = "cubic"  # grid: dx and dy interpolated separately with this method
@@ -99,7 +128,8 @@ FULL_PUPIL_DECAY  = 20     # px; the fit residual at the data border decays with
                            # length, so the extension joins the data without a step
 
 # Optical surface under test (user inputs in the GUI; defaults = lens L1 of the
-# manuscript: D = 39 mm, f = 237 mm, z = 173.5 mm; R assumes a plano-convex BK7 lens)
+# manuscript, [M] Sec. 2A: D = 39 mm, f = 237 mm, z = 173.5 mm; R assumes a
+# plano-convex BK7 lens: R = (n - 1) f with n = 1.515 at 632.8 nm)
 SURFACE_DEFAULTS = {"R": 122.06,   # radius of curvature of the tested surface (mm)
                     "f": 237.0,    # focal length (mm)
                     "D": 39.0,     # diameter of the aperture (mm)
@@ -109,21 +139,44 @@ SURFACE_DEFAULTS = {"R": 122.06,   # radius of curvature of the tested surface (
 
 PUPIL_MARGIN = 1.08        # size of the working square relative to the pupil diameter
 
-# Wavefront (same procedure as Arriaga et al., Appl. Phys. B 132:14, 2026, Eqs. 9-15)
-# Units: TA converted to mm with the scale of the ideal ray mapping (surface
-# parameters), W in micrometers
+# ── Wavefront (stage H) ──
+# The wavefront is reconstructed from the signed transverse aberrations following the
+# manuscript "Autonomous Wavefront Reconstruction from SLM-Based Ronchigrams Using a
+# Regularized Variational Model" [M] and its Supplemental Document [S]:
+#   TA = Gamma * s * dx                    [M] Eq. 13, [S] Eq. S8
+#   p = kappa * TA_x,  q = kappa * TA_y    [M] Eq. 15, [S] Eq. S14
+#   W_P: variational reconstruction        [M] Eqs. 19-26, [S] Eqs. S28-S45 (principal)
+#   W_G: Gauss-Legendre path integration   [M] Eqs. 27-30, [S] Eqs. S60-S75 (complementary)
+#   piston and tilt removal                [M] Eq. 31, [S] Eqs. S81-S82
+# Values used by the GUI (the manuscript leaves them as calibration factors):
+#   s     = physical size of a camera pixel at the plane z (pupil radius at z from the
+#           ideal ray tracing of the surface / pupil radius in pixels), mm/px
+#   Gamma = 1 (the TA is taken directly at the observation plane)
+#   kappa = WAVEFRONT_SIGN / z, i.e. -1/z (Rayces relation, slope = -TA / z)
+# W, W_P, W_G and the Zernike coefficients are given in micrometers; the pupil
+# coordinates are normalized to the unit disk (physical pupil radius = D/2).
 WAVEFRONT_SOURCE = "vertical_horizontal"  # TA_x from the vertical matrix and TA_y from the
                                           # horizontal one; "grid": dx, dy of the grid matrix
-TA_FIT_DEGREE  = 11        # Eq. 12: TA ~ sum_{l,h<=11} B_lh cos^l(t) sin^h(t) rho^(l+h)
-RADIAL_STEPS   = 2000      # Eq. 14: divisions of rho in the Riemann sum (article: 1e5)
-ANGULAR_STEPS  = 360       # Eq. 14: directions theta
-ZERNIKE_Q      = 50        # Eq. 15: default Zernike degree n (n = 50 -> 1326 coefficients).
+TA_FIT_DEGREE  = 11        # continuous TA surfaces: products of Legendre polynomials
+                           # P_m(x) P_n(y), m, n <= 11 ([M] Sec. 5B, [S] Eq. S18)
+WAVEFRONT_GRID = 201       # nodes per side of the Cartesian pupil grid where p, q, W_P and
+                           # W_G are computed (nodes with x^2 + y^2 <= 1 are used)
+WP_OMEGA       = 1.0       # confidence weight omega of every node ([M] Eqs. 19-22). The
+                           # manuscript gives no formula for omega; uniform confidence
+                           # (omega = 1) is the case of [M] Eq. 21
+WP_MU_CANDIDATES = np.logspace(-9, -1, 17)  # regularization parameters mu tested in the
+                           # L-curve ([S] Eq. S50: mu_l = 10^(a + l*delta), half a decade)
+GL_NODES       = 12        # Gauss-Legendre nodes N_G along each straight path ([M] Eq. 30).
+                           # The TA surfaces are polynomials of degree <= 22 along a line,
+                           # so 12 nodes integrate them exactly (degree 2*12 - 1 = 23)
+ZERNIKE_Q      = 50        # default Zernike degree n (n = 50 -> 1326 coefficients).
                            # The GUI lets the user change it before running.
-ZERNIKE_GRID   = 201       # samples per side of W_r used for the Zernike fit
-MAP_GRID       = 151       # samples per side of the maps shown in the GUI
-WAVEFRONT_SIGN = -1        # W = -integral(TA): sign convention checked with simulated
+WAVEFRONT_SIGN = -1        # sign of kappa (kappa = -1/z): convention checked with simulated
                            # Ronchigrams of known wavefront
-REMOVE_TERMS   = (0, 1, 2, 4)  # OSA/ANSI indices removed for display: piston, tilts, defocus
+REMOVE_TERMS   = (0, 1, 2)  # OSA/ANSI indices removed for display: piston and tilts, i.e.
+                            # the least-squares plane of [M] Eq. 31 (the defocus is kept)
+EXPORT_FIRST   = (59, 49)  # besides all the coefficients, the first 59 and the first 49
+                           # (OSA/ANSI order) are also saved in separate files ([S] Sec. 5)
 FIG_DPI        = 150       # resolution of the plots shown in the GUI
 
 # Fringe colors in the fringe review (same colors in the editor and in its result step)
@@ -186,7 +239,7 @@ def drawCurve(img, poly, a0, a1, color, thickness, vertical=True):
 
 
 def stripeChannel(rgb):
-    # Color channel that carries the fringes (manuscript, Eq. 6): the one with the
+    # Color channel that carries the fringes ([M] Sec. 3A): the one with the
     # largest contrast (standard deviation), so the color of the fringes does not
     # matter. Its intensity is stretched to 0-255 (percentiles 1 and 99.7) so dim
     # Ronchigrams are processed like bright ones.
@@ -338,7 +391,7 @@ def detectStripePeaks(smooth):
 
 def rowCentroid(grayRow, binRow, guess, halfWin, xMin=None, xMax=None):
     # Sub-pixel center of a bright fringe in one row: intensity-weighted centroid
-    # (Eq. 14 of the manuscript, intensity version) in a window centered on the
+    # ([M] Eq. 8, intensity version) in a window centered on the
     # current estimate, re-centered twice so the window is symmetric about the fringe.
     # The background (window minimum) is subtracted from the weights.
     n = len(grayRow)
@@ -411,7 +464,7 @@ def fringeRowCenters(rr, cnt, sc, lo, hi, pupil, refWidth=None):
 def bandAnchors(rr, cnt, center, nAnchors):
     # Anchor points of a fringe: its rows are divided in nAnchors bands and the anchor
     # point of each band is the mean of the row centers, weighted by the number of
-    # white pixels of each row (center of mass, Eqs. 14-15 of the manuscript)
+    # white pixels of each row (center of mass, [M] Eq. 8)
     ok = np.isfinite(center) & (cnt > 0)
     rr, cnt, center = rr[ok], cnt[ok].astype(np.float64), center[ok]
     if len(rr) < 2:
@@ -563,7 +616,7 @@ def trackFringes(binImg, pupil=None, nAnchors=N_ANCHORS):
     # whole length (a fixed vertical window only works for nearly vertical fringes).
     # White regions that do not cross the center row are followed from their own middle
     # row. The anchor points are, as before, the center of mass of the white pixels of
-    # the fringe in nAnchors bands along its length (Eqs. 14-15 of the manuscript).
+    # the fringe in nAnchors bands along its length ([M] Eq. 8).
     h, w = binImg.shape
     white = binImg > 0
     claimed = np.zeros((h, w), dtype=bool)
@@ -669,7 +722,7 @@ def windowLeaveFraction(binImg, peaks, halfWidth):
 def detectFringes(binImg, pupil, peaks, halfWidth, gray=None):
     # Anchor points of the fringes.
     #  - Nearly vertical fringes (the case of the Ronchi-SLM setup): vertical search
-    #    window around each peak of the column profile, as described in the manuscript.
+    #    window around each peak of the column profile h(x) ([M] Eq. 7, Sec. 3B).
     #  - Curved fringes (they leave their windows) or no valid peaks: fringe following.
     # Returns (stripes, method, fraction of rows leaving the windows).
     leave = None
@@ -765,7 +818,7 @@ def buildCentroidLines(binImg, peaks, medianGap, pupil, stripes=None, halfWidth=
 
 
 def surfaceMapping(R, f, D, K, z, n_samples=4000):
-    # Ideal Ronchi-SLM geometry (manuscript, Fig. 1): the grating is displayed in the
+    # Ideal Ronchi-SLM geometry ([M] Fig. 1, Sec. 2A): the grating is displayed in the
     # collimated beam, the surface under test (conic of radius R and conic constant K,
     # plano-convex lens of focal length f, so n = 1 + R/f) refracts every ray, and the
     # Ronchigram is recorded at a distance z from the surface vertex.
@@ -846,7 +899,8 @@ def buildTheoreticalRonchigram(shape, pupil, xc, spacing, width, mapping):
 
 
 def theoreticalLines(shape, pupil, xc, spacing, mapping, kNeed=0):
-    # Analytic centers of the theoretical stripes (manuscript: x_k = x_0 + k * lambda_exp),
+    # Analytic centers of the theoretical stripes (x_k = x_0 + k * lambda, cf. [M] Eq. 10;
+    # here lambda is the spacing measured in the Ronchigram),
     # mapped to the camera plane with the ideal ray mapping of the surface. For every
     # row, the camera abscissa whose entrance coordinate equals u_k is found exactly
     # (Newton), and a smooth polynomial in y is fitted to those points.
@@ -919,60 +973,21 @@ def centralIndex(lines, cx, cy):
     return int(np.argmin([abs(L["poly"](cy) - cx) for L in lines]))
 
 
-def fringesBetween(binImg, LA, LB):
-    # Number of fringes of the binary image lying between two detected fringes (0 for
-    # consecutive fringes): white runs found, row by row, in the middle of the gap
-    # between both centroid lines. The median over the rows is taken.
-    a0, a1 = max(LA["a0"], LB["a0"]), min(LA["a1"], LB["a1"])
-    if a1 - a0 < 4:
-        return 0
-    h, w = binImg.shape
-    counts = []
-    for y in np.arange(np.ceil(a0), a1, 2.0):
-        r = int(round(y))
-        if not 0 <= r < h:
-            continue
-        xa, xb = sorted((float(LA["poly"](y)), float(LB["poly"](y))))
-        if xb - xa < 6:
-            continue
-        i0, i1 = max(0, int(np.floor(xa))), min(w, int(np.ceil(xb)) + 1)
-        row = binImg[r, i0:i1] > 0
-        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
-        mid = i0 + 0.5 * (np.where(d == 1)[0] + np.where(d == -1)[0] - 1)
-        length = np.where(d == -1)[0] - np.where(d == 1)[0]
-        t = (mid - xa) / (xb - xa)
-        counts.append(int(np.sum((t > 0.2) & (t < 0.8) & (length >= 2))))
-    return int(round(float(np.median(counts)))) if counts else 0
-
-
-def fringeOrders(expLines, binImg, ie0, cy, spacing=None):
+def fringeOrders(expLines, ie0, cy):
     # Order of every fringe counted from the central one (order 0), as in the classical
-    # theory of the Ronchi test (Optical Shop Testing, Eq. 9.3: each fringe is one line
-    # of the ruling, order m). Neighbouring fringes differ by one order whatever their
-    # separation, so fringes compressed or spread by the aberrations keep their order.
-    # Orders are skipped only where a fringe is missing from the list (not detected, or
-    # deleted in the review): the binary image shows a fringe between two of them AND
-    # their separation is about twice (or more) that of the neighbouring fringes.
+    # theory of the Ronchi test ([OST] Eq. 9.3: each fringe is one line of the ruling,
+    # order m). The orders are assigned ONLY from the fringes confirmed by the user in
+    # the fringe review: sorted from left to right by their position on the center row
+    # (short fringes that do not reach that row use their closest point), neighbouring
+    # fringes differ by exactly one order, whatever their separation. So fringes
+    # compressed or spread by the aberrations keep their order, and nothing outside the
+    # confirmed list (e.g. other bright structures of the binary image) can change it.
+    # A deleted fringe simply does not exist for the matching: if a real fringe between
+    # two others is wrong, its points must be corrected (or the fringe added again).
     pos = [float(L["poly"](min(max(cy, L["a0"]), L["a1"]))) for L in expLines]
     seq = list(np.argsort(pos))
-    gaps = [pos[seq[j + 1]] - pos[seq[j]] for j in range(len(seq) - 1)]
-    step = []
-    for j, g in enumerate(gaps):
-        n = fringesBetween(binImg, expLines[seq[j]], expLines[seq[j + 1]])
-        if n > 0:
-            ref = [gaps[i] for i in (j - 1, j + 1) if 0 <= i < len(gaps)]
-            if spacing:
-                ref.append(float(spacing))
-            ref = min(ref) if ref else g
-            n = min(n, max(int(round(g / ref)) - 1, 0)) if ref > 0 else 0
-        step.append(1 + n)
     c = seq.index(ie0)
-    order = {ie0: 0}
-    for j in range(c + 1, len(seq)):
-        order[seq[j]] = order[seq[j - 1]] + step[j - 1]
-    for j in range(c - 1, -1, -1):
-        order[seq[j]] = order[seq[j + 1]] - step[j]
-    return order
+    return {int(ie): k - c for k, ie in enumerate(seq)}
 
 
 def lineDifferences(expLines, theoLines, pairs, pupil):
@@ -1118,7 +1133,7 @@ def plotPeaks(smooth, peaksR, peaks, removed, axisLabel):
 # STEP 1 — VERTICAL ALIGNMENT VERIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
 def stripeOrientation(rgb, pupil=None):
-    # Global orientation of the fringes, for any inclination (Sec. 3.1: Canny + Hough,
+    # Global orientation of the fringes, for any inclination ([M] Eq. 5: Canny + Hough,
     # median of the orientations).
     # The edges are taken from the BINARIZED fringes, not from the gray image: smooth
     # (sinusoidal) fringes have no sharp edges and Canny finds almost nothing on them,
@@ -1211,7 +1226,7 @@ def stripeOrientation(rgb, pupil=None):
 
 
 def measureCentralInclination(rgb, pupil=None):
-    # Residual inclination of the central stripes (Eq. 10 of the manuscript).
+    # Residual inclination of the central stripes ([M] Sec. 3A, after Eq. 5).
     # Each central stripe is represented by its anchor points along its whole length
     # (same segmentation and centroid recognition used in the analysis) and a straight
     # line x = a + b*y is fitted to them; its slope b = (x_bottom - x_top)/(y_bottom - y_top)
@@ -1252,14 +1267,24 @@ def measureCentralInclination(rgb, pupil=None):
 
 
 def verifyVerticalAlignment(rgb0, baseAngle=0.0, pupil=None):
-    # Refines the orientation until the residual inclination of the central stripes
-    # is below ANGLE_THRESHOLD. Every measurement rotates the ORIGINAL image by the
-    # total angle (Hough + corrections), so the rotations are never accumulated
-    # (each resampling would smooth the fringes a little more).
-    history = []
+    # Refines the coarse orientation (baseAngle) until the residual inclination of the
+    # central stripes is below ANGLE_THRESHOLD ([M] Sec. 3A: the correction is accepted
+    # only when the residual inclination of the centerlines is below the tolerance).
+    # Every measurement rotates the ORIGINAL image by the total angle (coarse +
+    # corrections), so the rotations are never accumulated (each resampling would
+    # smooth the fringes a little more).
+    # Safeguards (the measurement can be fooled by a bright edge or a broken fringe):
+    #  - a measured residual larger than ALIGN_MAX_CORRECTION, or a total correction
+    #    larger than it, is rejected and the iterations stop;
+    #  - at the end the iteration with the SMALLEST measured residual is kept (not
+    #    necessarily the last one), so an oscillating measurement cannot leave the image
+    #    worse than the best orientation found. If no measurement is valid, the coarse
+    #    orientation is kept.
+    history = []            # (total angle, measured residual, measures, valid)
     total = float(baseAngle)
     h0, w0 = rgb0.shape[:2]
     rgb = rotateImage(rgb0, total)
+    rejected = None
     for it in range(ALIGN_MAX_ITER + 1):
         pup = None
         if pupil is not None:
@@ -1270,19 +1295,34 @@ def verifyVerticalAlignment(rgb0, baseAngle=0.0, pupil=None):
             angle, measures = measureCentralInclination(rgb, pup)
         except RuntimeError:
             # Too few stripes detected automatically (e.g. a dim Ronchigram):
-            # the check is skipped and the Hough orientation is kept
+            # the check is skipped and the coarse orientation is kept
             angle, measures = 0.0, []
-        history.append((angle, measures))
+        if abs(angle) > ALIGN_MAX_CORRECTION:
+            rejected = (it, angle)
+            history.append((total, angle, measures, False))
+            break
+        history.append((total, angle, measures, True))
         if abs(angle) <= ANGLE_THRESHOLD or it == ALIGN_MAX_ITER:
             break
         # Rotating by -angle cancels the inclination of the stripes
+        if abs(total - angle - float(baseAngle)) > ALIGN_MAX_CORRECTION:
+            rejected = (it + 1, total - angle - float(baseAngle))
+            break
         total -= angle
         rgb = rotateImage(rgb0, total)
+
+    # Iteration kept: the valid one with the smallest measured residual
+    valid = [k for k, hst in enumerate(history) if hst[3]]
+    if valid:
+        kBest = min(valid, key=lambda k: abs(history[k][1]))
+        total, finalAngle, finalMeasures, _ = history[kBest]
+    else:
+        kBest, total, finalAngle, finalMeasures = None, float(baseAngle), None, []
+    rgb = rotateImage(rgb0, total)
     totalCorrection = total - float(baseAngle)
 
-    # Visualization: extremes of the central stripes and a vertical reference line
+    # Visualization: central stripes of the kept iteration and a vertical reference
     vis = rgb.copy()
-    finalAngle, finalMeasures = history[-1]
     for m in finalMeasures:
         pTop = (int(round(m["xTop"])), int(m["yTop"]))
         pBot = (int(round(m["xBot"])), int(m["yBot"]))
@@ -1292,13 +1332,23 @@ def verifyVerticalAlignment(rgb0, baseAngle=0.0, pupil=None):
         cv2.circle(vis, pBot, 6, (0, 255, 255), -1)
 
     text = []
-    for i, (a, ms) in enumerate(history):
-        text.append(f"Iteration {i}: residual angle = {a:.4f}°")
-    text.append(f"Threshold: {ANGLE_THRESHOLD}°")
+    for i, (tot_, a, ms, ok) in enumerate(history):
+        text.append(f"Iteration {i}: residual angle = {a:.4f}°"
+                    + ("" if ok else f"  (rejected: larger than {ALIGN_MAX_CORRECTION:g}°)"))
+    text.append(f"Threshold: {ANGLE_THRESHOLD}°   ·   maximum correction accepted: "
+                f"{ALIGN_MAX_CORRECTION:g}°")
+    if rejected is not None and rejected[0] == len(history):
+        text.append(f"Correction stopped: the total correction would exceed "
+                    f"{ALIGN_MAX_CORRECTION:g}° ({rejected[1]:.4f}°)")
+    if kBest is None:
+        text.append("No valid measurement: the coarse (Hough) orientation is kept")
+    else:
+        text.append(f"Kept: iteration {kBest} (smallest residual, {finalAngle:.4f}°)")
     text.append(f"Total correction applied: {totalCorrection:.4f}°")
-    text.append("Central stripes (straight line fitted to all their anchor points):")
-    text += [f"  x_top={m['xTop']:.2f}  x_bottom={m['xBot']:.2f}  Δ={m['dist']:.3f}"
-             for m in finalMeasures]
+    if finalMeasures:
+        text.append("Central stripes (straight line fitted to all their anchor points):")
+        text += [f"  x_top={m['xTop']:.2f}  x_bottom={m['xBot']:.2f}  Δ={m['dist']:.3f}"
+                 for m in finalMeasures]
     return rgb, vis, text, totalCorrection
 
 
@@ -1500,7 +1550,7 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
     # Theoretical centroid lines: analytic centers of the ideal stripes
     # (the order of every experimental fringe is counted first, so the theoretical
     #  lines of all those orders are available)
-    orders = fringeOrders(expLines, closed, ie0, cy, gap)
+    orders = fringeOrders(expLines, ie0, cy)
     theoLines = theoreticalLines((h, w), pup, xc, gap, mapping,
                                  kNeed=max(abs(o) for o in orders.values()))
     byOrder = {L["k"]: i for i, L in enumerate(theoLines)}
@@ -1523,8 +1573,7 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
 
     # ── Correspondence by order, counted from the central stripe ──
     # Fringe m of the Ronchigram corresponds to line m of the theoretical one
-    # (consecutive orders; orders are skipped only where the binary image shows a
-    # fringe that is not in the list, so a deleted fringe does not shift the rest)
+    # (consecutive orders over the fringes confirmed in the review, see fringeOrders)
     pairs = []
     for ie, L in enumerate(expLines):
         it = byOrder.get(orders[ie])
@@ -1782,7 +1831,7 @@ def extendToPupil(df, pupil, vector=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — WAVEFRONT (Eqs. 9-15 of the article)
+# STEP 5 — WAVEFRONT: TA surfaces, slopes, W_P (principal), W_G (complementary), Zernike
 # ══════════════════════════════════════════════════════════════════════════════
 ZERNIKE_NAMES = {
     (0, 0): "Piston", (1, -1): "Tilt Y", (1, 1): "Tilt X",
@@ -1795,9 +1844,11 @@ ZERNIKE_NAMES = {
 
 
 def fitTASurface(u, v, values, degree=TA_FIT_DEGREE):
-    # Eq. 12: least-squares fit of the TA point cloud with the polynomial
-    # sum_{l,h<=degree} A_lh x^l y^h (= B_lh cos^l sin^h rho^(l+h)).
-    # A Legendre basis spans exactly the same polynomials and is better conditioned.
+    # Continuous TA surface ([M] Sec. 5B, [S] Eqs. S18-S19 with omega = 1): least-squares
+    # fit of the TA point cloud (u, v normalized to the unit pupil) with the products
+    # of Legendre polynomials P_m(u) P_n(v), m, n <= degree. They span the same
+    # polynomials as sum A_lh u^l v^h of the previous articles (Appl. Phys. B, Eq. 12;
+    # Optik, Eq. 4) and are numerically better conditioned.
     V = npleg.legvander2d(u, v, [degree, degree])
     coef = np.linalg.lstsq(V, values, rcond=None)[0]
     rms = float(np.sqrt(np.mean((V @ coef - values) ** 2)))
@@ -1850,8 +1901,8 @@ def zernikeEval(coefs, idx, rho, theta, skip=(), progress=None):
 
 
 def zernikeFit(idx, rho, theta, values, chunk=4000, progress=None):
-    # Least squares fit (Eq. 49 of the manuscript) through the normal equations,
-    # accumulated in chunks so many points of W_r can be used without much memory
+    # Least-squares Zernike fit ([S] Eq. S109, uniform weights) through the normal
+    # equations, accumulated in chunks so many points can be used without much memory
     J = len(idx)
     AtA = np.zeros((J, J))
     Atb = np.zeros(J)
@@ -1868,79 +1919,239 @@ def zernikeFit(idx, rho, theta, values, chunk=4000, progress=None):
     return coefs
 
 
-def computeWavefront(taX, taY, pupil, nZernike=ZERNIKE_Q, mapping=None, mmPerPx=None):
-    # taX, taY: point clouds (x, y, value) of the transverse aberrations in x and y
-    cx, cy, r = pupil
+def pupilGridOperators(N=WAVEFRONT_GRID):
+    # Cartesian grid of N x N nodes on [-1, 1]^2 (rows = y downwards, as the images);
+    # the nodes inside the unit pupil (x^2 + y^2 <= 1) are the unknowns of W_P.
+    # Discrete operators of [M] Eqs. 23-24 / [S] Eqs. S55-S56, built only with nodes
+    # inside the pupil (no value outside the pupil is ever used):
+    #   Dx, Dy: centered differences; one-sided at the pupil border when one of the two
+    #           neighbours is outside; a node without neighbours along an axis is left
+    #           out of that operator. kx, ky = node index of every row of Dx, Dy.
+    #   L:      5-point Laplacian, only at nodes whose four neighbours are inside.
+    g = np.linspace(-1.0, 1.0, N)
+    h = float(g[1] - g[0])
+    X, Y = np.meshgrid(g, g)
+    inside = X ** 2 + Y ** 2 <= 1.0
+    nid = -np.ones((N, N), dtype=int)
+    nid[inside] = np.arange(int(inside.sum()))
+    nodes = list(zip(*np.where(inside)))
 
-    # ── Eq. 12: TA surfaces ──
+    def isIn(i, j):
+        return 0 <= i < N and 0 <= j < N and inside[i, j]
+
+    def derivative(di, dj):
+        rows, cols, vals, keep = [], [], [], []
+        for (i, j) in nodes:
+            fwd, bwd = isIn(i + di, j + dj), isIn(i - di, j - dj)
+            k = len(keep)
+            if fwd and bwd:          # centered difference
+                rows += [k, k]
+                cols += [nid[i + di, j + dj], nid[i - di, j - dj]]
+                vals += [0.5 / h, -0.5 / h]
+            elif fwd:                # one-sided (forward)
+                rows += [k, k]
+                cols += [nid[i + di, j + dj], nid[i, j]]
+                vals += [1.0 / h, -1.0 / h]
+            elif bwd:                # one-sided (backward)
+                rows += [k, k]
+                cols += [nid[i, j], nid[i - di, j - dj]]
+                vals += [1.0 / h, -1.0 / h]
+            else:
+                continue
+            keep.append(nid[i, j])
+        D = sparse.csr_matrix((vals, (rows, cols)), shape=(len(keep), len(nodes)))
+        return D, np.array(keep, dtype=int)
+
+    Dx, kx = derivative(0, 1)        # x = columns
+    Dy, ky = derivative(1, 0)        # y = rows
+    rows, cols, vals = [], [], []
+    for (i, j) in nodes:
+        nb = [(i, j + 1), (i, j - 1), (i + 1, j), (i - 1, j)]
+        if all(isIn(a, b) for a, b in nb):
+            k = len(rows) // 5
+            rows += [k] * 5
+            cols += [nid[i, j]] + [nid[a, b] for a, b in nb]
+            vals += [-4.0 / h ** 2] + [1.0 / h ** 2] * 4
+    L = sparse.csr_matrix((vals, (rows, cols)), shape=(len(rows) // 5, len(nodes)))
+    return {"g": g, "h": h, "X": X, "Y": Y, "inside": inside,
+            "Dx": Dx, "kx": kx, "Dy": Dy, "ky": ky, "L": L}
+
+
+def solveVariational(ops, p, q, mu, omega):
+    # Discrete variational reconstruction W_P ([M] Eqs. 22-26, [S] Eqs. S40-S45):
+    #   u* = argmin ||W^1/2 (Dx u - p)||^2 + ||W^1/2 (Dy u - q)||^2 + mu ||L u||^2
+    # whose optimality condition is the sparse linear system ([M] Eq. 24)
+    #   (Dx^T W Dx + Dy^T W Dy + mu L^T L) u = Dx^T W p + Dy^T W q,
+    # solved together with the zero-mean (piston) constraint 1^T u = 0 ([M] Eq. 25)
+    # through a Lagrange multiplier ([S] Eq. S44). p, q, omega: values at the nodes.
+    # Returns u, the weighted slope residual R ([S] Eq. S48) and the smoothness S
+    # ([S] Eq. S49).
+    Dx, kx, Dy, ky, L = ops["Dx"], ops["kx"], ops["Dy"], ops["ky"], ops["L"]
+    n = Dx.shape[1]
+    wx, wy = omega[kx], omega[ky]
+    A = (Dx.T @ sparse.diags(wx) @ Dx + Dy.T @ sparse.diags(wy) @ Dy
+         + mu * (L.T @ L)).tocsc()
+    b = Dx.T @ (wx * p[kx]) + Dy.T @ (wy * q[ky])
+    ones = sparse.csc_matrix(np.ones((n, 1)))
+    M = sparse.bmat([[A, ones], [ones.T, None]], format="csc")
+    u = spsolve(M, np.concatenate([b, [0.0]]))[:n]
+    R = float(np.sqrt(np.sum(wx * (Dx @ u - p[kx]) ** 2) + np.sum(wy * (Dy @ u - q[ky]) ** 2)))
+    S = float(np.linalg.norm(L @ u))
+    return u, R, S
+
+
+def lCurveCorner(mus, R, S):
+    # Discrete L-curve ([S] Eqs. S51-S54): xi = log R(mu), eta = log S(mu), t = log mu;
+    # curvature kappa_L(t) = |xi' eta'' - eta' xi''| / (xi'^2 + eta'^2)^(3/2), evaluated
+    # with finite differences; the selected mu is the one of maximum curvature (the
+    # two extreme candidates are excluded, their derivatives are one-sided).
+    xi, eta, t = np.log(R), np.log(S), np.log(mus)
+    d1x, d1y = np.gradient(xi, t), np.gradient(eta, t)
+    d2x, d2y = np.gradient(d1x, t), np.gradient(d1y, t)
+    curv = np.abs(d1x * d2y - d1y * d2x) / ((d1x ** 2 + d1y ** 2) ** 1.5 + 1e-30)
+    curv[0] = curv[-1] = -np.inf
+    return int(np.argmax(curv)), curv
+
+
+def wavefrontGaussLegendre(slopes, X, Y, nodes=GL_NODES):
+    # Complementary reconstruction W_G ([M] Eqs. 27-30, [S] Eqs. S60-S73): line
+    # integral of the slope field g = (p, q) along the straight path from the pupil
+    # center r0 = (0, 0) to every node r_i,
+    #   W_G(r_i) = C + 1/2 sum_m w_m g[r0 + (xi_m + 1)/2 (r_i - r0)] . (r_i - r0),
+    # with the Gauss-Legendre nodes xi_m and weights w_m on [-1, 1]. The slopes at the
+    # quadrature nodes are evaluated from the continuous TA surfaces ([S] Eq. S73).
+    # C = W_G(r0) = 0 here; the piston is fixed afterwards with a zero pupil average.
+    xi, w = np.polynomial.legendre.leggauss(nodes)
+    W = np.zeros_like(X)
+    for xm, wm in zip(xi, w):
+        t = 0.5 * (xm + 1.0)
+        p, q = slopes(t * X, t * Y)
+        W += 0.5 * wm * (p * X + q * Y)
+    return W
+
+
+def removePlane(W, X, Y):
+    # [M] Eq. 31: subtracts the least-squares plane a0 + ax x + ay y (piston and tilt)
+    # over the pupil nodes. Returns the detrended values and (a0, ax, ay).
+    A = np.column_stack([np.ones_like(X), X, Y])
+    coef = np.linalg.lstsq(A, W, rcond=None)[0]
+    return W - A @ coef, coef
+
+
+def computeWavefront(taX, taY, pupil, nZernike=ZERNIKE_Q, mapping=None, mmPerPx=None,
+                     progress=None):
+    # taX, taY: point clouds (x, y, value) of the signed transverse aberrations in x and
+    # y, in pixels of the working image (positions = experimental fringe nodes).
+    # Returns the TA surfaces, the slope field, W_P (principal), W_G (complementary),
+    # the Zernike fit of W_P and the maps shown in stage H.
+    cx, cy, r = pupil
+    def prog(f):
+        if progress:
+            progress(f)
+
+    # ── Continuous TA surfaces (pixels), coordinates normalized to the pupil ──
     cX, rmsX = fitTASurface((taX[0] - cx) / r, (taX[1] - cy) / r, taX[2])
     cY, rmsY = fitTASurface((taY[0] - cx) / r, (taY[1] - cy) / r, taY[2])
 
-    # ── Eqs. 9, 13, 14: directional derivative along r and radial Riemann sum ──
-    rho = np.linspace(0.0, 1.0, RADIAL_STEPS + 1)
-    theta = np.linspace(0.0, 2 * np.pi, ANGULAR_STEPS, endpoint=False)
-    Rg, Tg = np.meshgrid(rho, theta, indexing="ij")
-    U, V = Rg * np.cos(Tg), Rg * np.sin(Tg)
-    tx = npleg.legval2d(U, V, cX)
-    ty = npleg.legval2d(U, V, cY)
-    taR = tx * np.cos(Tg) + ty * np.sin(Tg)            # TA along r (Eq. 9)
-    # Rayces: dW/dh = -TA/z, with TA in mm (px * mm/px) and h the height at the surface
-    # (h = rho_in * D/2, rho_in from the ideal ray mapping). W in micrometers.
-    rhoIn = camToEntrance(mapping, rho)
-    dRhoIn = np.gradient(rhoIn, rho)[:, None]
-    kW = 1000.0 * mmPerPx * (mapping["D"] / 2.0) / mapping["z"]
-    Wpolar = WAVEFRONT_SIGN * kW * cumulative_trapezoid(taR * dRhoIn, rho, axis=0, initial=0)
+    # ── Calibration ([M] Eqs. 13 and 15) ──
+    # TA [mm] = Gamma * s * dx [px], with Gamma = 1 and s = mmPerPx;
+    # p = kappa * TA_x, q = kappa * TA_y, with kappa = WAVEFRONT_SIGN / z (-1/z).
+    # The slopes are expressed per unit of normalized pupil coordinate (pupil radius
+    # a = D/2 mm) and W in micrometers:  dW/du [µm] = 1000 * a * kappa * TA [mm].
+    gamma = 1.0
+    s = float(mmPerPx)
+    kappa = WAVEFRONT_SIGN / mapping["z"]
+    a = mapping["D"] / 2.0
+    kSlope = 1000.0 * a * kappa * gamma * s       # µm per unit of u, per pixel of TA
 
-    # Polar -> Cartesian samples on the unit disk
-    thetaExt = np.append(theta, 2 * np.pi)
-    interp = RegularGridInterpolator((rho, thetaExt),
-                                     np.concatenate([Wpolar, Wpolar[:, :1]], axis=1))
-    g = np.linspace(-1, 1, ZERNIKE_GRID)
-    GX, GY = np.meshgrid(g, g)
-    inside = GX ** 2 + GY ** 2 <= 1.0
-    rq = np.sqrt(GX[inside] ** 2 + GY[inside] ** 2)
-    tq = np.mod(np.arctan2(GY[inside], GX[inside]), 2 * np.pi)
-    Wq = interp(np.column_stack([rq, tq]))
+    def slopes(U, V):
+        # Slope field g = (p, q) at normalized pupil points ([M] Eq. 15, [S] Eq. S20)
+        return (kSlope * npleg.legval2d(U, V, cX), kSlope * npleg.legval2d(U, V, cY))
 
-    # ── Eq. 15 / Eq. 49: Zernike fit of degree n (OSA/ANSI order) on W_r ──
+    ops = pupilGridOperators(WAVEFRONT_GRID)
+    X, Y, inside = ops["X"], ops["Y"], ops["inside"]
+    xq, yq = X[inside], Y[inside]
+    p, q = slopes(xq, yq)
+    omega = np.full(len(xq), WP_OMEGA)
+    prog(0.05)
+
+    # ── W_P: variational reconstruction, mu selected by the L-curve ──
+    nMu = len(WP_MU_CANDIDATES)
+    sols, Rs, Ss = [], [], []
+    for k, mu in enumerate(WP_MU_CANDIDATES):
+        u, Rk, Sk = solveVariational(ops, p, q, mu, omega)
+        sols.append(u)
+        Rs.append(Rk)
+        Ss.append(Sk)
+        prog(0.05 + 0.75 * (k + 1) / nMu)
+    kBest, curv = lCurveCorner(WP_MU_CANDIDATES, np.array(Rs), np.array(Ss))
+    WPq = sols[kBest]
+    mu = float(WP_MU_CANDIDATES[kBest])
+    # Differential fidelity of W_P ([S] Eq. S47), informative
+    eGrad = Rs[kBest] / (np.sqrt(np.sum(omega * p ** 2) + np.sum(omega * q ** 2)) + 1e-30)
+
+    # ── W_G: Gauss-Legendre integration along straight paths from the center ──
+    WGq = wavefrontGaussLegendre(slopes, xq, yq)
+    WGq = WGq - WGq.mean()                         # zero pupil average (piston)
+    prog(0.85)
+
+    # ── Piston and tilt removed for display ([M] Eq. 31) ──
+    WPd, planeP = removePlane(WPq, xq, yq)
+    WGd, planeG = removePlane(WGq, xq, yq)
+
+    # ── Zernike fit of W_P (degree n, OSA/ANSI order, normalized polynomials) ──
+    rq = np.sqrt(xq ** 2 + yq ** 2)
+    tq = np.mod(np.arctan2(yq, xq), 2 * np.pi)
     idx = zernikeIndices(nZernike)
-    coefs = zernikeFit(idx, rq, tq, Wq)
-    fitRms = float(np.sqrt(np.mean((zernikeEval(coefs, idx, rq, tq) - Wq) ** 2)))
+    coefs = zernikeFit(idx, rq, tq, WPq)
+    Wz = zernikeEval(coefs, idx, rq, tq)
+    fitRms = float(np.sqrt(np.mean((Wz - WPq) ** 2)))
+    WfQ = zernikeEval(coefs, idx, rq, tq, skip=REMOVE_TERMS)
+    prog(1.0)
 
-    # Maps shown in the GUI, on a smaller regular grid (rows = y downwards)
-    g = np.linspace(-1, 1, MAP_GRID)
-    GX, GY = np.meshgrid(g, g)
-    inside = GX ** 2 + GY ** 2 <= 1.0
-    rq = np.sqrt(GX[inside] ** 2 + GY[inside] ** 2)
-    tq = np.mod(np.arctan2(GY[inside], GX[inside]), 2 * np.pi)
-    Wmap = np.full(GX.shape, np.nan)
-    Wmap[inside] = zernikeEval(coefs, idx, rq, tq, skip=REMOVE_TERMS)
-    Wraw = np.full(GX.shape, np.nan)
-    Wraw[inside] = interp(np.column_stack([rq, tq]))
-    def onGrid(c):
-        M = np.full(GX.shape, np.nan)
-        M[inside] = npleg.legval2d(GX[inside], GY[inside], c)
+    def onGrid(values):
+        M = np.full(X.shape, np.nan)
+        M[inside] = values
         return M
-    taRmap = np.full(GX.shape, np.nan)
-    taRmap[inside] = (onGrid(cX)[inside] * np.cos(tq) + onGrid(cY)[inside] * np.sin(tq))
 
+    def filled(values):
+        # Values on the whole square grid: the nodes outside the pupil take the value
+        # of the nearest pupil node. Used only to interpolate near the pupil border
+        # (W_F export); those nodes are never part of the reconstruction.
+        M = onGrid(values)
+        _, ind = cKDTree(np.column_stack([xq, yq])).query(
+            np.column_stack([X[~inside], Y[~inside]]))
+        M[~inside] = values[ind]
+        return M
+
+    lcurve = pd.DataFrame({"mu": WP_MU_CANDIDATES, "slope residual R": Rs,
+                           "smoothness S": Ss, "curvature": curv})
     return {"idx": idx, "coefs": coefs, "fitRms": fitRms, "rmsX": rmsX, "rmsY": rmsY,
-            "nZernike": nZernike, "nPointsFit": int(len(Wq)),
+            "nZernike": nZernike, "nPointsFit": int(len(WPq)),
             "surface": {k_: mapping[k_] for k_ in ("R", "f", "D", "K", "z")},
-            "taX": onGrid(cX), "taY": onGrid(cY), "taR": taRmap,
-            "Wraw": Wraw, "W": Wmap, "grid": g,
-            "Wpolar": (rho, thetaExt, np.concatenate([Wpolar, Wpolar[:, :1]], axis=1))}
+            "calibration": {"s_mm_per_px": s, "Gamma": gamma, "kappa_per_mm": kappa},
+            # maps (rows = y downwards), NaN outside the pupil
+            "grid": ops["g"],
+            "taX": onGrid(1000.0 * gamma * s * npleg.legval2d(xq, yq, cX)),   # TA_x, µm
+            "taY": onGrid(1000.0 * gamma * s * npleg.legval2d(xq, yq, cY)),   # TA_y, µm
+            "WP": onGrid(WPq), "WPd": onGrid(WPd),
+            "WG": onGrid(WGq), "WGd": onGrid(WGd),
+            "W": onGrid(WfQ),
+            "WPfilled": filled(WPq), "WGfilled": filled(WGq),
+            "mu": mu, "lcurve": lcurve, "eGrad": float(eGrad),
+            "nNodes": int(len(WPq))}
 
 
 def computeWF(wf, geom, progress=None):
     # Final fit on the full-size image:
-    #  1) W_r (result of the TA integration, Eq. 14) is interpolated to a matrix of
-    #     the same size as the crop, [c d], with the same pupil as the crop
-    #     (each crop pixel is mapped to the working frame with the same rotation and
-    #     translation applied by the pipeline, then normalized to the pupil, Eq. 37).
-    #  2) The Zernike polynomials of degree n are fitted by least squares (Eq. 49)
-    #     to ALL the pupil pixels of that large W_r.
+    #  1) W_P is interpolated (bilinear, from the pupil grid) to a matrix of the same
+    #     size as the crop, [c d], with the same pupil as the crop (each crop pixel is
+    #     mapped to the working frame with the same rotation and translation applied by
+    #     the pipeline, then normalized to the pupil).
+    #  2) The Zernike polynomials of degree n are fitted by least squares to ALL the
+    #     pupil pixels of that large W_P.
     #  3) W_F = that fit evaluated on the same [c d] matrix (NaN outside the pupil).
+    # W_G is interpolated the same way and saved for reference.
     h, w = geom["cropShape"]
     A = geom["cropToWork"]
     cx, cy, r = geom["pupil"]
@@ -1950,35 +2161,39 @@ def computeWF(wf, geom, progress=None):
     u, v = (xw - cx) / r, (yw - cy) / r
     rho = np.sqrt(u ** 2 + v ** 2)
     inside = rho <= 1.0
+    uin, vin = u[inside], v[inside]
     rin = rho[inside]
-    theta = np.mod(np.arctan2(v[inside], u[inside]), 2 * np.pi)
+    theta = np.mod(np.arctan2(vin, uin), 2 * np.pi)
     idx = wf["idx"]
 
-    # 1) W_r interpolated to the crop size
-    rG, tG, Wp = wf["Wpolar"]
-    interp = RegularGridInterpolator((rG, tG), Wp)
-    Wr_in = interp(np.column_stack([rin, theta]))
+    # 1) W_P (and W_G) interpolated to the crop size; grid axes = (y, x)
+    g = wf["grid"]
+    pts = np.column_stack([vin, uin])
+    WP_in = RegularGridInterpolator((g, g), wf["WPfilled"])(pts)
+    WG_in = RegularGridInterpolator((g, g), wf["WGfilled"])(pts)
 
-    # 2) Zernike fit of degree n on the large W_r
-    p = (lambda f: progress(0.75 * f)) if progress else None
-    coefs = zernikeFit(idx, rin, theta, Wr_in, progress=p)
+    # 2) Zernike fit of degree n on the large W_P
+    pr = (lambda f: progress(0.75 * f)) if progress else None
+    coefs = zernikeFit(idx, rin, theta, WP_in, progress=pr)
 
-    # 3) W_F on the same matrix
-    p = (lambda f: progress(0.75 + 0.25 * f)) if progress else None
-    full = zernikeEval(coefs, idx, rin, theta, progress=p)
+    # 3) W_F on the same matrix, and W_F without piston and tilt ([M] Eq. 31)
+    pr = (lambda f: progress(0.75 + 0.25 * f)) if progress else None
+    full = zernikeEval(coefs, idx, rin, theta, progress=pr)
     low = np.zeros_like(full)
     for j, Z in zernikeTerms(idx[:max(REMOVE_TERMS) + 1], rin, theta):
         if j in REMOVE_TERMS:
             low += coefs[j] * Z
     WF = np.full((h, w), np.nan)
     WFc = np.full((h, w), np.nan)
-    Wr = np.full((h, w), np.nan)
+    WP = np.full((h, w), np.nan)
+    WG = np.full((h, w), np.nan)
     WF[inside] = full
     WFc[inside] = full - low
-    Wr[inside] = Wr_in
-    rms = float(np.sqrt(np.mean((full - Wr_in) ** 2)))
-    return {"WF": WF, "WFc": WFc, "Wr": Wr, "coefs": coefs, "nPoints": int(inside.sum()),
-            "fitRms": rms}
+    WP[inside] = WP_in
+    WG[inside] = WG_in
+    rms = float(np.sqrt(np.mean((full - WP_in) ** 2)))
+    return {"WF": WF, "WFc": WFc, "WP": WP, "WG": WG, "coefs": coefs,
+            "nPoints": int(inside.sum()), "fitRms": rms}
 
 
 def plotPupilMap(M, title, label, cmap="jet"):
@@ -2020,8 +2235,7 @@ def plotZernikeBars(coefs, idx, nMax=6):
                        ha="right", fontsize=8)
     ax.axhline(0, color="gray", lw=0.8)
     ax.set_ylabel("Coefficient (µm)")
-    ax.set_title(f"Zernike coefficients up to n = {nMax} "
-                 "(piston, tilts and defocus removed)")
+    ax.set_title(f"Zernike coefficients up to n = {nMax} (piston and tilts removed)")
     plt.tight_layout()
     return figToArray(fig)
 
@@ -2298,10 +2512,10 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
                  "Download: Excel (3 sheets) + .npz with the 3 matrices"]})
     prog(96)
 
-    # ── Wavefront (Eqs. 9-15 of the article), micrometers ──
+    # ── Wavefront (stage H), micrometers ──
     stageStart["H"] = len(results)
-    # The integration uses the SIGNED differences (experimental - theoretical);
-    # the maps adjusted to min = 0 are only for display (manuscript, Sec. 3.5)
+    # The reconstruction uses the SIGNED differences (experimental - theoretical);
+    # the maps adjusted to min = 0 are only for display ([M] Sec. 3B, [S] Sec. 3A)
     if WAVEFRONT_SOURCE == "grid":
         g_ = full["Grid"]
         taX = (g_["x"].values, g_["y"].values, g_["dx"].values)
@@ -2313,41 +2527,72 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
         taY = (full["Horizontal"]["x"].values, full["Horizontal"]["y"].values,
                full["Horizontal"]["signed"].values)
         srcText = "TA_x = vertical matrix, TA_y = horizontal matrix (signed)"
-    wf = computeWavefront(taX, taY, pupil, nZernike, mapping, mmPerPx)
-    prog(98)
+    wf = computeWavefront(taX, taY, pupil, nZernike, mapping, mmPerPx,
+                          progress=lambda f: prog(96 + 3 * f))
 
-    results.append({"title": "TA Surface Fit (Eq. 12) - x",
-                    "image": plotPupilMap(wf["taX"], "TA_x fitted surface (Eq. 12)",
-                                          "TA_x (px)"),
-                    "text": [srcText,
-                             f"Polynomial degree: {TA_FIT_DEGREE} (l, h <= {TA_FIT_DEGREE})",
-                             f"Fit RMS: {wf['rmsX']:.4f} px"]})
-    results.append({"title": "TA Surface Fit (Eq. 12) - y",
-                    "image": plotPupilMap(wf["taY"], "TA_y fitted surface (Eq. 12)",
-                                          "TA_y (px)"),
-                    "text": [f"Polynomial degree: {TA_FIT_DEGREE}",
-                             f"Fit RMS: {wf['rmsY']:.4f} px"]})
-    results.append({"title": "Directional Derivative (Eq. 9)",
-                    "image": plotPupilMap(wf["taR"], "TA along r (directional derivative)",
-                                          "TA_r (px)"),
-                    "text": ["TA_r = TA_x cos(theta) + TA_y sin(theta)",
-                             "dW/dh = -TA_r / z  (TA in mm, h = height at the surface)"]})
-    results.append({"title": "Wavefront W_r - Radial Integration (Eq. 14)",
-                    "image": plotPupilMap(wf["Wraw"], "W_r: integration of TA (Eq. 14)",
-                                          "W_r (µm)"),
-                    "text": [f"Divisions of rho: {RADIAL_STEPS}",
-                             f"Directions theta: {ANGULAR_STEPS}",
-                             "Includes piston, tilt and defocus"]})
+    cal = wf["calibration"]
+    taText = [f"TA = Gamma * s * dx  (manuscript, Eq. 13), with Gamma = {cal['Gamma']:g} and "
+              f"s = {1000 * cal['s_mm_per_px']:.4f} µm/px (pupil radius at the plane z from the "
+              "ray tracing / pupil radius in pixels)",
+              "Signed TA located at the experimental fringe nodes (Supplemental Document, Eqs. S6, S9)",
+              f"Continuous surface: least-squares fit with products of Legendre polynomials "
+              f"P_m(x) P_n(y), m, n <= {TA_FIT_DEGREE}  (manuscript, Sec. 5B; Supplemental Document, Eq. S18), omega = 1"]
+    results.append({"title": "TA Surface Fit - x",
+                    "image": plotPupilMap(wf["taX"], "TA_x: continuous surface (Legendre, "
+                                          f"m, n <= {TA_FIT_DEGREE})", "TA_x (µm)"),
+                    "text": [srcText] + taText +
+                            [f"Fit RMS: {wf['rmsX']:.4f} px"]})
+    results.append({"title": "TA Surface Fit - y",
+                    "image": plotPupilMap(wf["taY"], "TA_y: continuous surface (Legendre, "
+                                          f"m, n <= {TA_FIT_DEGREE})", "TA_y (µm)"),
+                    "text": ["TA_y from the pseudo-orthogonal representation (the same "
+                             "Ronchigram rotated by pi/2, manuscript, Sec. 4A)"] + taText[:1] +
+                            [f"Fit RMS: {wf['rmsY']:.4f} px"]})
     names = ", ".join(ZERNIKE_NAMES.get(wf["idx"][j], str(j)) for j in REMOVE_TERMS)
+    lc = wf["lcurve"]["mu"].values
+    results.append({"title": "Wavefront W_P - Variational (Eq. 19)",
+                    "image": plotPupilMap(wf["WPd"], "W_P: variational reconstruction "
+                                          "(piston and tilt removed)", "W_P (µm)"),
+                    "text": [f"Slopes: p = kappa * TA_x, q = kappa * TA_y  (manuscript, Eq. 15), "
+                             f"kappa = -1/z = {cal['kappa_per_mm']:.6g} 1/mm",
+                             "W_P = argmin_u  ∫ omega |grad u - g|^2 dA + mu ∫ (lap u)^2 dA  "
+                             "(manuscript, Eq. 19)",
+                             "Discrete system (manuscript, Eqs. 22-26): centered differences, "
+                             "5-point Laplacian, zero-mean constraint 1^T u = 0",
+                             f"Grid: {WAVEFRONT_GRID} x {WAVEFRONT_GRID}, "
+                             f"{wf['nNodes']} nodes in the pupil, omega = {WP_OMEGA:g}",
+                             f"mu = {wf['mu']:.3g}: maximum curvature of the L-curve "
+                             f"(Supplemental Document, Eqs. S50-S54), {len(lc)} candidates from {lc[0]:.0e} "
+                             f"to {lc[-1]:.0e}",
+                             f"Differential fidelity E_grad = {wf['eGrad']:.4f}  (Supplemental Document, Eq. S47)",
+                             "Piston and tilt removed for display (manuscript, Eq. 31)",
+                             f"P-V: {np.nanmax(wf['WPd']) - np.nanmin(wf['WPd']):.4f} µm, "
+                             f"RMS: {np.nanstd(wf['WPd']):.4f} µm",
+                             "The L-curve values are saved in the .mat file of the "
+                             "last step"]})
+    results.append({"title": "Wavefront W_G - Gauss-Legendre (Eqs. 27-30)",
+                    "image": plotPupilMap(wf["WGd"], "W_G: Gauss-Legendre path integration "
+                                          "(piston and tilt removed)", "W_G (µm)"),
+                    "text": ["W_G(r_i) = C + 1/2 sum_m w_m g[r0 + (xi_m + 1)/2 (r_i - r0)] . "
+                             "(r_i - r0)  (manuscript, Eqs. 27-30)",
+                             f"Straight paths from the pupil center r0; N_G = {GL_NODES} "
+                             "Gauss-Legendre nodes; slopes from the continuous TA surfaces",
+                             "Piston: zero pupil average; piston and tilt removed for "
+                             "display (manuscript, Eq. 31)",
+                             "Complementary reconstruction from the same slope field; the "
+                             "Zernike coefficients and W_F come from W_P",
+                             f"P-V: {np.nanmax(wf['WGd']) - np.nanmin(wf['WGd']):.4f} µm, "
+                             f"RMS: {np.nanstd(wf['WGd']):.4f} µm"]})
     pv = float(np.nanmax(wf["W"]) - np.nanmin(wf["W"]))
     rmsW = float(np.nanstd(wf["W"]))
     results.append({"title": "Wavefront W_f (final)",
-                    "image": plotPupilMap(wf["W"], f"W_f: Zernike fit of W_r (n = {nZernike})",
+                    "image": plotPupilMap(wf["W"], f"W_f: Zernike fit of W_P (n = {nZernike})",
                                           "W_f (µm)"),
                     "text": [f"Zernike degree n = {nZernike} "
-                             f"({len(wf['idx'])} coefficients, OSA/ANSI order)",
-                             f"Fitted on {wf['nPointsFit']} points of W_r",
-                             f"Removed: {names}",
+                             f"({len(wf['idx'])} coefficients, OSA/ANSI order, normalized)",
+                             f"Fitted on the {wf['nPointsFit']} pupil nodes of W_P "
+                             f"(fit RMS {wf['fitRms']:.2e} µm)",
+                             f"Removed: {names}  (manuscript, Eq. 31)",
                              f"P-V: {pv:.4f} µm",
                              f"RMS: {rmsW:.4f} µm",
                              f"R = {mapping['R']:g} mm, f = {mapping['f']:g} mm, "
@@ -2360,7 +2605,7 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
     summaryW = pd.DataFrame(
         {"Value": [nZernike, len(wf["idx"]), wf["nPointsFit"], pv, rmsW,
                    f"{cropH} x {cropW}"]},
-        index=["Zernike degree n", "Coefficients", "Points of W_r used",
+        index=["Zernike degree n", "Coefficients", "Pupil nodes of W_P used",
                "P-V of W_f (µm)", "RMS of W_f (µm)", "Size of W_F"])
     summaryW.index.name = "Wavefront"
     results.append({
@@ -2370,12 +2615,14 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
                                                 "cropToWork": cropToWork,
                                                 "pupil": pupil}},
         "data": {"wavefront": wf},
-        "text": [f"1) W_r (integration of TA) is interpolated to the crop size "
+        "text": [f"1) W_P (variational reconstruction) is interpolated to the crop size "
                  f"({cropH} x {cropW}), with the same pupil as the crop",
                  f"2) Zernike fit up to n = {nZernike} (OSA/ANSI order) on all the "
-                 "pupil pixels of that W_r",
+                 "pupil pixels of that W_P",
                  "3) W_F = that fit on the same matrix, NaN outside the pupil",
-                 "Download: coefficients (.xlsx, .csv) and W_F (.mat, .csv)",
+                 "Download: all the coefficients and the first "
+                 + " and the first ".join(str(k) for k in EXPORT_FIRST) +
+                 " (.xlsx, .csv), and W_F (.mat, .csv)",
                  "W_F is computed when downloading; it may take a while"]})
     prog(100)
 
@@ -2604,8 +2851,9 @@ def loadLogo(label, fileName, maxW, maxH, placeholder):
     except NameError:
         pass
     bases.append(os.getcwd())
-    path = next((os.path.join(b, fileName) for b in bases
-                 if os.path.isfile(os.path.join(b, fileName))), "")
+    # Each folder is searched directly and in its "img" subfolder (repository layout)
+    candidates = [os.path.join(b, sub, fileName) for b in bases for sub in ("", "img")]
+    path = next((c for c in candidates if os.path.isfile(c)), "")
     if path:
         try:
             im = Image.open(path).convert("RGBA")
@@ -2738,12 +2986,48 @@ def feRender(_=None):
                                  font=(FONT, 12, "bold"))
 
 
+def feListWheel(event):
+    # Scrolls the list of fringes of the fringe review
+    if getattr(event, "num", None) == 4:
+        step = -1
+    elif getattr(event, "num", None) == 5:
+        step = 1
+    else:
+        step = -1 if event.delta > 0 else 1
+    feListCanvas.yview_scroll(step, "units")
+
+
+def feListBindWheel(_=None):
+    for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        feListCanvas.bind_all(ev, feListWheel)
+
+
+def feListUnbindWheel(_=None):
+    for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        feListCanvas.unbind_all(ev)
+
+
+def feShowSelected(row):
+    # Scrolls the list so the row of the selected fringe is visible (e.g. a new fringe,
+    # which is added at the end of the list)
+    feListCanvas.update_idletasks()
+    total = max(feList.winfo_height(), 1)
+    top, bottom = feListCanvas.yview()
+    y0, y1 = row.winfo_y() / total, (row.winfo_y() + row.winfo_height()) / total
+    if y0 < top:
+        feListCanvas.yview_moveto(y0)
+    elif y1 > bottom:
+        feListCanvas.yview_moveto(max(0.0, y1 - (bottom - top)))
+
+
 def feRefreshList():
+    # Rebuilds the list of fringes (one button per fringe) inside its scrollable area
     for wdg in feList.winfo_children():
         wdg.destroy()
     if not fe["stripes"]:
         tk.Label(feList, text="No fringes. Press “New fringe” to add one.", bg=WHITE,
                  fg=MUTED, font=(FONT, 9, "italic")).pack(anchor="w")
+    selRow = None
     for i, a in enumerate(fe["stripes"]):
         row = tk.Frame(feList, bg=WHITE)
         row.pack(fill="x", pady=1)
@@ -2756,6 +3040,10 @@ def feRefreshList():
                   bg=GOLD if sel else "#EEF3F9", fg=TEXT,
                   font=(FONT, 10, "bold" if sel else "normal"), padx=8, pady=2
                   ).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        if sel:
+            selRow = row
+    if selRow is not None:
+        feShowSelected(selRow)
     nOk = sum(1 for a in fe["stripes"] if len(a) >= MIN_MANUAL_ANCHORS)
     feInfo.config(text=f"Detected automatically: {fe['nAuto']}   ·   Now: {len(fe['stripes'])} "
                        f"({nOk} with at least {MIN_MANUAL_ANCHORS} points)")
@@ -3490,9 +3778,21 @@ def renderSlide():
     canvasText.yview_moveto(0)
 
 
+def saveTable(df, path):
+    # Saves a table as .xlsx (needs the openpyxl package; if it is missing, e.g. in an
+    # executable built without it, the error says so) or as .csv.
+    if path.endswith(".xlsx"):
+        df.to_excel(path, index=False)
+    else:
+        df.to_csv(path, index=False)
+
+
 def exportWavefront(result):
     # Saves the Zernike coefficients (OSA/ANSI order) and W_F. W_F is computed here,
     # in the background, because it has the full size of the crop.
+    # Every file is written independently: if one of them cannot be written (a file
+    # open in Excel, a missing package, no permission in the folder...) the others are
+    # still saved and the message lists which one failed and why.
     global exportRunning
     if exportRunning:
         return
@@ -3510,45 +3810,84 @@ def exportWavefront(result):
     exportRunning = True
     btnDownload.config(state="disabled", bg="#9E9E9E")
     h, w = geom["cropShape"]
-    lblFooter.config(text=f"Interpolating W_r to {h} × {w} and fitting Zernike n = {nZ}… 0%")
+    lblFooter.config(text=f"Interpolating W_P to {h} × {w} and fitting Zernike n = {nZ}… 0%")
+
+    def explain(ex):
+        # Readable reason of a failed file
+        if isinstance(ex, PermissionError):
+            return "permission denied (is the file open in Excel or another program?)"
+        if isinstance(ex, ImportError) or "openpyxl" in str(ex):
+            return ("the package openpyxl is not available, so .xlsx files cannot be "
+                    "written (the .csv files have the same data)")
+        return f"{type(ex).__name__}: {ex}"
 
     def work():
         global exportRunning
+        saved, failed = [], []
+
+        def write(fname, func):
+            try:
+                func(fname)
+                saved.append(fname)
+            except Exception as ex:
+                failed.append(f"{os.path.basename(fname)}: {explain(ex)}")
+
         try:
             def progress(f):
                 root.after(0, lambda: lblFooter.config(
-                    text=f"Interpolating W_r to {h} × {w} and fitting Zernike n = {nZ}… {int(100 * f)}%"))
+                    text=f"Interpolating W_P to {h} × {w} and fitting Zernike n = {nZ}… {int(100 * f)}%"))
             out = computeWF(wf, geom, progress=progress)
             WF = out["WF"]
-            # Zernike coefficients of the fit on the large W_r (OSA/ANSI order:
-            # j = (n(n+2) + m)/2), the ones that generate W_F
+            # Zernike coefficients of the fit on the large W_P (OSA/ANSI order,
+            # j = (n(n+2) + m)/2), the ones that generate W_F, in micrometers
             zdf = pd.DataFrame({"j (OSA/ANSI)": range(len(wf["idx"])),
                                 "n": [n for n, m in wf["idx"]],
                                 "m": [m for n, m in wf["idx"]],
-                                "coefficient": out["coefs"]})
-            zdf.to_excel(base + "_Zernike_OSA.xlsx", index=False)
-            zdf.to_csv(base + "_Zernike_OSA.csv", index=False)
-            savemat(base + "_W_F.mat", {
-                "W_F": WF, "W_F_without_piston_tilt_defocus": out["WFc"],
-                "W_r_interpolated": out["Wr"],
+                                "coefficient (µm)": out["coefs"]})
+            for ext in (".xlsx", ".csv"):
+                write(base + "_Zernike_OSA" + ext, lambda f: saveTable(zdf, f))
+            # The first 59 and 49 coefficients (OSA/ANSI order) in separate files. The
+            # Zernike polynomials are orthonormal, so they are practically the ones a
+            # fit with only those modes would give.
+            for k in EXPORT_FIRST:
+                if k <= len(zdf):
+                    for ext in (".xlsx", ".csv"):
+                        write(f"{base}_Zernike_OSA_first{k}{ext}",
+                              lambda f, k=k: saveTable(zdf.iloc[:k], f))
+            lc = wf["lcurve"]
+            write(base + "_W_F.mat", lambda f: savemat(f, {
+                "W_F": WF, "W_F_without_piston_tilt": out["WFc"],
+                "W_P_interpolated": out["WP"], "W_G_interpolated": out["WG"],
                 "fit_points": out["nPoints"], "fit_rms": out["fitRms"],
                 "zernike_coefficients": np.asarray(out["coefs"]),
                 "zernike_n": np.array([n for n, m in wf["idx"]]),
                 "zernike_m": np.array([m for n, m in wf["idx"]]),
                 "zernike_degree": nZ,
+                "mu": wf["mu"], "lcurve_mu": lc["mu"].values,
+                "lcurve_R": lc["slope residual R"].values,
+                "lcurve_S": lc["smoothness S"].values,
+                "s_mm_per_px": wf["calibration"]["s_mm_per_px"],
+                "Gamma": wf["calibration"]["Gamma"],
+                "kappa_per_mm": wf["calibration"]["kappa_per_mm"],
                 "units": "micrometers (pupil radius normalized to 1)",
                 "R_mm": wf["surface"]["R"], "f_mm": wf["surface"]["f"],
                 "D_mm": wf["surface"]["D"], "K": wf["surface"]["K"],
-                "z_mm": wf["surface"]["z"]})
-            np.savetxt(base + "_W_F.csv", WF, delimiter=",", fmt="%.10g")
-            files = [base + "_Zernike_OSA.xlsx", base + "_Zernike_OSA.csv",
-                     base + "_W_F.mat", base + "_W_F.csv"]
-            root.after(0, lambda: messagebox.showinfo(
-                "Saved", f"W_F: {h} × {w} (NaN outside the pupil)\nZernike fit on {out['nPoints']} pixels of W_r\n\nSaved to:\n"
-                         + "\n".join(files)))
-            root.after(0, lambda: lblFooter.config(text="W_F and Zernike coefficients saved."))
+                "z_mm": wf["surface"]["z"]}))
+            write(base + "_W_F.csv",
+                  lambda f: np.savetxt(f, WF, delimiter=",", fmt="%.10g"))
+            msg = (f"W_F: {h} × {w} (NaN outside the pupil)\n"
+                   f"Zernike fit on {out['nPoints']} pixels of W_P\n\nSaved to:\n"
+                   + "\n".join(saved))
+            if failed:
+                msg += "\n\nNot saved:\n" + "\n".join(failed)
+                root.after(0, lambda: messagebox.showwarning("Saved with errors", msg))
+                root.after(0, lambda: lblFooter.config(
+                    text=f"Saved {len(saved)} files; {len(failed)} could not be saved."))
+            else:
+                root.after(0, lambda: messagebox.showinfo("Saved", msg))
+                root.after(0, lambda: lblFooter.config(text="W_F and Zernike coefficients saved."))
         except Exception as ex:
-            msg = str(ex)
+            msg = explain(ex)
             root.after(0, lambda: messagebox.showerror("Error", msg))
         finally:
             exportRunning = False
@@ -3855,12 +4194,31 @@ tk.Label(feCtrl, text="Select a fringe and click on the image to add anchor poin
                       "anchor points after you confirm.",
          bg=WHITE, fg=MUTED, font=(FONT, 9, "italic"), wraplength=S(310),
          justify="left").pack(fill="x", pady=(0, 8))
-# The action buttons are packed first at the bottom so they are always visible; the
-# list of fringes takes the remaining space above them
+# The action buttons are packed first at the bottom so they are always visible. The
+# list of fringes goes in its own scrollable area above them: its requested height is
+# fixed, so a long list (many fringes) never makes the window grow and never pushes
+# the buttons out of the screen; the list is scrolled with its scrollbar or the wheel.
 feBottom = tk.Frame(feCtrl, bg=WHITE)
 feBottom.pack(side="bottom", fill="x")
-feList = tk.Frame(feCtrl, bg=WHITE)
-feList.pack(side="top", fill="x", pady=(0, 6))
+feListArea = tk.Frame(feCtrl, bg=WHITE)
+feListArea.pack(side="top", fill="both", expand=True, pady=(0, 6))
+feListCanvas = tk.Canvas(feListArea, bg=WHITE, highlightthickness=0, width=S(290),
+                         height=S(120))
+feListScroll = tk.Scrollbar(feListArea, orient="vertical", command=feListCanvas.yview)
+feListCanvas.configure(yscrollcommand=feListScroll.set)
+feListScroll.pack(side="right", fill="y")
+feListCanvas.pack(side="left", fill="both", expand=True)
+feList = tk.Frame(feListCanvas, bg=WHITE)          # the rows of feRefreshList go here
+feListWin = feListCanvas.create_window((0, 0), window=feList, anchor="nw")
+feList.bind("<Configure>",
+            lambda e: feListCanvas.configure(scrollregion=feListCanvas.bbox("all")))
+feListCanvas.bind("<Configure>",
+                  lambda e: feListCanvas.itemconfigure(feListWin, width=e.width))
+# Mouse wheel over the list: <MouseWheel> on Windows and macOS, buttons 4/5 on Linux.
+# It is bound only while the pointer is over the list, so the wheel keeps working as
+# before in the rest of the GUI.
+feListArea.bind("<Enter>", feListBindWheel)
+feListArea.bind("<Leave>", feListUnbindWheel)
 rowFe1 = tk.Frame(feBottom, bg=WHITE)
 rowFe1.pack(fill="x", pady=(0, 5))
 makeButton(rowFe1, "+  New fringe", feNewFringe, NAVY, size=10, padx=8, pady=4
