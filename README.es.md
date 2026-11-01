@@ -52,7 +52,7 @@ Una corrida completa tiene 62 pasos de procesamiento y de salida, agrupados en o
 
 ### Entorno
 
-La aplicación está pensada principalmente como programa de escritorio para Windows. El código en Python también puede correr en otros sistemas que tengan Tkinter y los paquetes científicos necesarios.
+La aplicación funciona como programa de escritorio en Windows y en macOS (procesadores Apple e Intel). Los ejecutables listos para usar de los dos sistemas se generan automáticamente (ver [Ejecutables (Windows y macOS)](#ejecutables-windows-y-macos)). El código en Python también puede correr en otros sistemas que tengan Tkinter y los paquetes científicos necesarios.
 
 Configuración recomendada:
 
@@ -73,7 +73,7 @@ El código importa los siguientes paquetes externos:
 - `Pillow`
 - `openpyxl` para exportar a Excel
 
-Tkinter viene con la distribución estándar de Python en Windows. En algunas distribuciones de Linux hay que instalarlo aparte con el gestor de paquetes del sistema.
+Tkinter viene con la distribución estándar de Python en Windows y con los instaladores de macOS de [python.org](https://www.python.org/downloads/macos/). Con el Python de Homebrew en macOS hay que instalarlo aparte (`brew install python-tk`). En algunas distribuciones de Linux hay que instalarlo aparte con el gestor de paquetes del sistema.
 
 ## Instalación
 
@@ -129,11 +129,13 @@ python -m pip install -r requirements.txt
 
 ## Abrir la aplicación
 
-Hay dos formas de abrir el programa.
+Hay tres formas de abrir el programa. Los ejecutables no necesitan tener Python instalado.
 
-**Ejecutable de Windows.** Haz doble clic en `VariationalRonchiSensor.exe`. No hace falta instalar Python. La primera vez puede tardar unos segundos en abrir mientras el ejecutable se descomprime.
+**Ejecutable de Windows.** Haz doble clic en `VariationalRonchiSensor.exe`. La primera vez puede tardar unos segundos en abrir mientras el ejecutable se descomprime.
 
-**Código en Python.** Desde la carpeta del repositorio, ejecuta:
+**Aplicación de macOS.** Descomprime `VariationalRonchiSensor-macOS-AppleSilicon.zip` (procesadores Apple M1, M2, M3, M4…) o `VariationalRonchiSensor-macOS-Intel.zip` (procesadores Intel) y abre `VariationalRonchiSensor.app`. La primera vez, macOS la bloquea porque no está firmada por Apple; ver [Abrir la app en macOS](#abrir-la-app-en-macos).
+
+**Código en Python.** Desde la carpeta del repositorio, ejecuta (en macOS, usa `python3`):
 
 ```bash
 python Ronchi.py
@@ -468,6 +470,9 @@ Los siguientes valores están definidos como constantes al principio de `Ronchi.
 ├── Ronchi.py
 ├── README.md
 ├── README.es.md
+├── .github/
+│   └── workflows/
+│       └── build.yml
 ├── requirements.txt
 ├── LICENSE
 ├── CITATION.cff
@@ -485,11 +490,41 @@ Los siguientes valores están definidos como constantes al principio de `Ronchi.
 
 `Ronchi.py` encuentra automáticamente los logos de `img/`. Al generar el ejecutable, inclúyelos con PyInstaller (`--add-data`) para que el `.exe` los muestre.
 
-## Ejecutable de Windows
+## Ejecutables (Windows y macOS)
 
-El ejecutable de Windows se puede distribuir aparte del código en Python, por ejemplo en la página de **Releases** de GitHub. Conviene generarlo a partir de un commit etiquetado, para que se sepa a qué versión del código corresponde.
+Los ejecutables se generan automáticamente con GitHub Actions (archivo `.github/workflows/build.yml`) cada vez que cambian `Ronchi.py`, los logos de `img/` o el archivo del flujo de trabajo en las ramas `main` o `corrections-variational`. También se puede iniciar una generación a mano. Cada generación produce tres archivos:
 
-Si los logos institucionales se incluyen con PyInstaller, agrégalos como archivos de datos y conserva sus nombres. Aquí no se fijan comandos de ejemplo, porque el separador y las opciones de empaquetado pueden cambiar según el sistema operativo y el proceso de publicación.
+| Archivo | Sistema |
+|---|---|
+| `VariationalRonchiSensor-Windows` | Windows (`VariationalRonchiSensor.exe`) |
+| `VariationalRonchiSensor-macOS-AppleSilicon` | macOS con procesadores Apple (M1, M2, M3, M4…) |
+| `VariationalRonchiSensor-macOS-Intel` | macOS con procesadores Intel |
+
+Para descargarlos:
+
+1. Abre la pestaña **Actions** del repositorio.
+2. Selecciona el flujo **Build executables** y luego la corrida más reciente con palomita verde.
+3. Abajo, en la página de la corrida, en **Artifacts**, descarga el archivo de tu sistema. GitHub entrega cada uno como `.zip`; el de macOS trae adentro otro `.zip` con la app, que también hay que descomprimir.
+
+Para iniciar una generación a mano: **Actions** ▸ **Build executables** ▸ **Run workflow**. Cada generación tarda de 10 a 15 minutos. Las descargas se conservan 90 días. Para tener un enlace de descarga permanente, agrega los archivos a una versión en la página de **Releases** de GitHub; conviene que los ejecutables salgan de un commit etiquetado, para que se sepa a qué versión del código corresponden.
+
+Los logos van incluidos dentro de los ejecutables, así que se muestran sin la carpeta `img/`.
+
+### Abrir la app en macOS
+
+La app de macOS no está firmada ni notarizada por Apple, así que macOS la bloquea la primera vez:
+
+1. Haz doble clic en `VariationalRonchiSensor.app`. macOS muestra un aviso de que no puede verificar la app. Selecciona **OK** o **Listo** (no la mandes a la papelera).
+2. Abre **Configuración del Sistema ▸ Privacidad y seguridad**.
+3. Baja hasta el mensaje sobre `VariationalRonchiSensor` y selecciona **Abrir de todos modos**. Si lo pide, confirma con tu contraseña.
+
+Después de eso, la app abre normalmente. Si no aparece el botón **Abrir de todos modos**, se puede quitar la marca de cuarentena desde la Terminal (ajusta la ruta a donde esté la app):
+
+```bash
+xattr -dr com.apple.quarantine /Applications/VariationalRonchiSensor.app
+```
+
+La primera vez puede tardar unos segundos en abrir. La app se generó en macOS 15; las versiones muy antiguas de macOS podrían no abrirla. En ese caso, corre el código en Python.
 
 ## Recomendaciones de reproducibilidad
 

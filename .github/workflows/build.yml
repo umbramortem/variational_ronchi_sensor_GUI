@@ -1,0 +1,110 @@
+# Builds the executables of the Variational Ronchi Sensor GUI with PyInstaller:
+#   - macOS for Apple processors (M1, M2, M3, M4...)  -> VariationalRonchiSensor-macOS-AppleSilicon.zip
+#   - macOS for Intel processors                       -> VariationalRonchiSensor-macOS-Intel.zip
+#   - Windows                                          -> VariationalRonchiSensor-Windows.zip
+# It runs when Ronchi.py, the logos (img/) or this file change on the branches below, or
+# by hand from the Actions tab ("Run workflow"). The results are downloaded from the
+# summary page of the run (section "Artifacts").
+#
+# Genera los ejecutables de la GUI Variational Ronchi Sensor con PyInstaller:
+#   - macOS para procesadores Apple (M1, M2, M3, M4...)
+#   - macOS para procesadores Intel
+#   - Windows
+# Corre cuando cambian Ronchi.py, los logos (img/) o este archivo en las ramas de abajo,
+# o a mano desde la pestaña Actions ("Run workflow"). Los resultados se descargan de la
+# página de resumen de la corrida (sección "Artifacts").
+
+name: Build executables
+
+on:
+  push:
+    branches: [main, corrections-variational]
+    paths:
+      - "Ronchi.py"
+      - "img/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15          # Apple processors (arm64) / procesadores Apple
+            label: AppleSilicon
+          - runner: macos-15-intel    # Intel processors (x86_64) / procesadores Intel
+            label: Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false                  # the Windows .exe of the repository is not needed
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy pandas matplotlib opencv-python Pillow openpyxl pyinstaller
+
+      - name: Check Tkinter
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Build the app
+        run: |
+          pyinstaller --noconfirm --clean --windowed \
+            --name "VariationalRonchiSensor" \
+            --osx-bundle-identifier "mx.variationalronchisensor.gui" \
+            --add-data "img/UNAM.png:." \
+            --add-data "img/UASLPlogo.png:." \
+            --add-data "img/INAOE.jpg:." \
+            --hidden-import openpyxl \
+            Ronchi.py
+
+      # ditto keeps the structure of the .app (links and permissions) inside the zip
+      # ditto conserva la estructura de la .app (enlaces y permisos) dentro del zip
+      - name: Compress the app
+        run: |
+          ditto -c -k --keepParent dist/VariationalRonchiSensor.app \
+            "VariationalRonchiSensor-macOS-${{ matrix.label }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VariationalRonchiSensor-macOS-${{ matrix.label }}
+          path: VariationalRonchiSensor-macOS-${{ matrix.label }}.zip
+          retention-days: 90
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy pandas matplotlib opencv-python Pillow openpyxl pyinstaller
+
+      - name: Build the executable
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name "VariationalRonchiSensor"
+          --add-data "img/UNAM.png;."
+          --add-data "img/UASLPlogo.png;."
+          --add-data "img/INAOE.jpg;."
+          --hidden-import openpyxl
+          Ronchi.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VariationalRonchiSensor-Windows
+          path: dist/VariationalRonchiSensor.exe
+          retention-days: 90

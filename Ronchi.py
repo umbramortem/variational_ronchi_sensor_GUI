@@ -22,6 +22,7 @@ from PIL import Image, ImageTk
 import threading
 import tempfile
 import os
+import sys
 import time
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2936,9 +2937,64 @@ class Label(tk.Label):
             super().configure(text=T(self.textEn))
 
 
-class Button(tk.Button):
-    # tk.Button with the same behaviour as Label above
-    # tk.Button con el mismo comportamiento que Label de arriba
+class _LabelButton(tk.Label):
+    # Button drawn with a tk.Label, used on macOS: there tk.Button ignores the background
+    # color, so the colored buttons with white text of the GUI would be white on white.
+    # It accepts the same options used by the GUI (command, bg, fg, activebackground,
+    # disabledforeground, state, relief, ...) and runs the command when the mouse button
+    # is released over it, like a normal button.
+    # Botón dibujado con un tk.Label, que se usa en macOS: ahí tk.Button ignora el color
+    # de fondo, así que los botones de color con texto blanco de la GUI quedarían blanco
+    # sobre blanco. Acepta las mismas opciones que usa la GUI (command, bg, fg,
+    # activebackground, disabledforeground, state, relief, ...) y ejecuta el comando al
+    # soltar el botón del ratón sobre él, como un botón normal.
+    def __init__(self, master=None, **kw):
+        self._command = kw.pop("command", None)
+        super().__init__(master, **kw)
+        self._pressed = False
+        self.bind("<ButtonPress-1>", self._press, add="+")
+        self.bind("<ButtonRelease-1>", self._release, add="+")
+        self.bind("<Enter>", lambda e: self._hover(True), add="+")
+        self.bind("<Leave>", lambda e: self._hover(False), add="+")
+
+    def configure(self, cnf=None, **kw):
+        if "command" in kw:
+            self._command = kw.pop("command")
+        return super().configure(cnf, **kw)
+    config = configure
+
+    def _enabled(self):
+        return str(tk.Label.cget(self, "state")) != "disabled"
+
+    def _hover(self, inside):
+        # "active" shows activebackground / activeforeground (as tk.Button)
+        # "active" muestra activebackground / activeforeground (como tk.Button)
+        if self._enabled():
+            tk.Label.configure(self, state="active" if inside else "normal")
+
+    def _press(self, event):
+        self._pressed = self._enabled()
+
+    def _release(self, event):
+        inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        if self._pressed and inside and self._enabled() and self._command:
+            self._command()
+        self._pressed = False
+
+
+# On macOS the buttons are _LabelButton; on Windows and Linux they are normal tk.Button.
+# (The environment variable RONCHI_FLAT_BUTTONS=1 forces _LabelButton, to test the macOS
+# buttons on another system.)
+# En macOS los botones son _LabelButton; en Windows y Linux son tk.Button normales.
+# (La variable de entorno RONCHI_FLAT_BUTTONS=1 obliga a usar _LabelButton, para probar
+# los botones de macOS en otro sistema.)
+IS_MAC = sys.platform == "darwin"
+_ButtonBase = _LabelButton if (IS_MAC or os.environ.get("RONCHI_FLAT_BUTTONS")) else tk.Button
+
+
+class Button(_ButtonBase):
+    # Button with the same behaviour as Label above (texts in the selected language)
+    # Botón con el mismo comportamiento que Label de arriba (textos en el idioma seleccionado)
     def __init__(self, master=None, **kw):
         self.textEn = kw.get("text")
         if "text" in kw:
@@ -3041,7 +3097,8 @@ BLUE_BTN  = "#0B5394"   # main action button
                         # botón de acción principal
 GREEN_BTN = "#2E8B57"   # download button
                         # botón de descarga
-FONT      = "Segoe UI"
+FONT      = "Helvetica Neue" if IS_MAC else "Segoe UI"   # font of the system (macOS / Windows)
+                                                         # fuente del sistema (macOS / Windows)
 
 # ── Pipeline stages (letter, tab name) ──
 # ── Etapas del proceso (letra, nombre de la pestaña) ──
@@ -4722,6 +4779,10 @@ feCanvas.bind("<B1-Motion>", feOnDrag)
 feCanvas.bind("<ButtonRelease-1>", feOnRelease)
 feCanvas.bind("<Button-3>", feOnDelete)
 feCanvas.bind("<Control-Button-1>", feOnDelete)
+if IS_MAC:
+    # On macOS, Tk reports the right mouse button as button 2
+    # En macOS, Tk reporta el botón derecho del ratón como el botón 2
+    feCanvas.bind("<Button-2>", feOnDelete)
 
 cardFeCtrl = card(viewFringes, "Fringes")
 cardFeCtrl.pack(side="right", fill="y")
