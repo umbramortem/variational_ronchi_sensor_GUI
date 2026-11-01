@@ -27,10 +27,8 @@ import time
 # PARAMETERS
 # ══════════════════════════════════════════════════════════════════════════════
 # Vertical alignment verification
-ANGLE_THRESHOLD   = 0.01   # max residual inclination accepted (degrees). The Hough angle
-                           # is only a first estimate: with curved fringes (e.g. spherical
-                           # aberration) it can be off by ~0.5 deg, so the line fit refines it
-ALIGN_MAX_ITER    = 5      # max number of correction iterations
+ANGLE_THRESHOLD   = 0.3    # max residual inclination accepted (degrees)
+ALIGN_MAX_ITER    = 3      # max number of correction iterations
 ALIGN_N_CENTRAL   = 3      # number of central stripes used to check verticality
 
 # Stripe segmentation
@@ -44,41 +42,13 @@ MIN_COMPONENT_AREA = 300   # connected components smaller than this are discarde
                            # Low on purpose: dim fringes are kept; false detections are
                            # removed by the user in the fringe review
 CLOSE_KERNEL       = 10    # size of the square kernel of the morphological closing (px)
-CURVED_CLOSE_KERNEL = (3, 10)   # (width, height) of the closing used with curved fringes
-                           # (fringe following): elongated along the fringes, so breaks along
-                           # a fringe are still joined but neighbouring fringes that are very
-                           # close together (compressed by the aberrations) are not merged
 SPURIOUS_GAP       = 0.6   # peaks closer than this fraction of the median gap are spurious
 
 # Centroid lines
-N_ANCHORS   = 15           # anchor points per stripe used to fit its center curve
-POLY_DEGREE = 2            # minimum degree of the polynomial fitted to each stripe
-POLY_MAX_DEGREE = 2        # maximum degree (chosen with the residual, BIC, if > 2).
-                           # Kept at 2: with real Ronchigrams higher degrees follow the
-                           # irregularities of the fringes (worse agreement between
-                           # diffraction orders of the same surface)
-CURVED_MAX_DEGREE = 6      # maximum degree when the fringes were found by fringe following
-                           # (curved, S-shaped fringes that a parabola cannot follow)
-SUBPIXEL_ANCHORS = False   # True: anchor points from intensity-weighted centroids (more
-                           # exact with clean simulated fringes, less robust with real ones)
-MIN_GOOD_ANCHORS = 5       # sub-pixel anchor points needed to accept a stripe automatically
-WINDOW_LEAVE_MAX = 0.38    # fringe following is used when the fringes touch the border of
-                           # their vertical search window in more than this fraction of
-                           # rows (curved fringes). Real, nearly vertical Ronchigrams stay
-                           # below 0.25; strongly curved ones are above 0.5
-MIN_FRINGE_CHORD = 0.5     # fringe following: a fringe must span at least this fraction of
-                           # the pupil chord at its position (shorter pieces are discarded)
+N_ANCHORS   = 10           # anchor points per stripe used to fit its center curve
+POLY_DEGREE = 2            # degree of the polynomial fitted to each stripe
 MIN_STRIPE_PIXELS = 200    # white pixels needed in a stripe window to look for anchors
 MIN_MANUAL_ANCHORS = 3     # anchor points needed per fringe in the fringe review
-EDGE_TOL = 0.015           # a fringe row ending closer than this fraction of the pupil radius
-                           # (at least 3 px) to the pupil border is cut by the pupil
-TA_POSITION = "experimental"   # where each TA value is located in the pupil:
-                           # "experimental" = on the measured fringe (Optical Shop Testing,
-                           # Eq. 9.30: m and m0 are compared at the same point (x, y));
-                           # "theoretical" = on the theoretical line (previous versions)
-EDGE_PARTIAL = 0.35        # a fringe next to the pupil border narrower than this fraction of
-                           # its neighbour is only the visible part of a cut fringe
-EDGE_MIN_ROWS = 5          # rows not cut by the pupil needed to measure the fringe width
 POINT_STEP  = 5            # distance (px) between consecutive points of a centroid line.
                            # Nyquist criterion: points per line = length / 5  (<= image size / 5)
 
@@ -223,53 +193,17 @@ def detectPupil(rgb):
 
 
 def rotateImage(rgb, angle):
-    # Rotation about the image center. Lanczos interpolation keeps the fringe profiles
-    # (bilinear interpolation smooths them and shifts their centers by fractions of px)
     h, w = rgb.shape[:2]
-    if abs(angle) < 1e-9:
-        return rgb.copy()
     M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(rgb, M, (w, h), flags=cv2.INTER_LANCZOS4,
+    return cv2.warpAffine(rgb, M, (w, h), flags=cv2.INTER_LINEAR,
                           borderMode=cv2.BORDER_CONSTANT)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STRIPE DETECTION (same algorithm for experimental and theoretical Ronchigrams)
 # ══════════════════════════════════════════════════════════════════════════════
-def growWideFringes(binary, gray):
-    # A fringe much wider than the window of the adaptive threshold is not detected in
-    # its middle: every pixel there is about as bright as its neighbourhood, so only
-    # its narrow ends are found. The detected fringes are grown into the adjacent
-    # pixels that are as bright as the fringes themselves (>= 90 % of the local fringe
-    # brightness). Only large regions are added (a missing wide fringe); small changes
-    # at the borders of normal fringes are not made, so ordinary Ronchigrams are
-    # segmented exactly as before.
-    white = binary > 0
-    if not white.any():
-        return binary
-    size = min(binary.shape)
-    g = gray.astype(np.float32)
-    sigma = max(5.0, 0.06 * size)
-    num = cv2.GaussianBlur(g * white, (0, 0), sigma)
-    den = cv2.GaussianBlur(white.astype(np.float32), (0, 0), sigma)
-    level = np.where(den > 0.05, num / np.maximum(den, 1e-6), float(g[white].mean()))
-    cand = ((g >= 0.9 * level) & ~white).astype(np.uint8)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
-    near = cv2.dilate(white.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-    out = binary.copy()
-    minArea = (0.12 * size) ** 2
-    for k in range(1, n):
-        if stats[k, cv2.CC_STAT_AREA] < minArea:
-            continue
-        comp = labels == k
-        if (comp & near).any():
-            out[comp] = 255
-    return out
-
-
-def binarizeStripes(rgb, closeKernel=None):
+def binarizeStripes(rgb):
     # CLAHE on the fringe channel -> threshold -> remove small components -> closing
-    # closeKernel: (width, height) of the closing; default CLOSE_KERNEL x CLOSE_KERNEL
     R = stripeChannel(rgb)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     Rb = clahe.apply(R)
@@ -286,10 +220,8 @@ def binarizeStripes(rgb, closeKernel=None):
     keep = np.zeros(n, dtype=bool)
     keep[1:] = stats[1:, cv2.CC_STAT_AREA] > MIN_COMPONENT_AREA
     clean = np.where(keep[labels], 255, 0).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,
-                                       closeKernel or (CLOSE_KERNEL, CLOSE_KERNEL))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (CLOSE_KERNEL, CLOSE_KERNEL))
     closed = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel)
-    closed = growWideFringes(closed, R)
     return Rb, binary, clean, closed
 
 
@@ -336,129 +268,10 @@ def detectStripePeaks(smooth):
     return peaksR, peaks, medianGap, minProm, removed
 
 
-def rowCentroid(grayRow, binRow, guess, halfWin, xMin=None, xMax=None):
-    # Sub-pixel center of a bright fringe in one row: intensity-weighted centroid
-    # (Eq. 14 of the manuscript, intensity version) in a window centered on the
-    # current estimate, re-centered twice so the window is symmetric about the fringe.
-    # The background (window minimum) is subtracted from the weights.
-    n = len(grayRow)
-    c = float(guess)
-    for _ in range(3):
-        # Near the pupil border the fringe is cut: the window is shrunk symmetrically
-        # so it stays inside the pupil (otherwise the centroid is pulled inwards).
-        # If it becomes too small, None is returned and the binary center is used.
-        hw = halfWin
-        if xMin is not None:
-            hw = min(halfWin, c - xMin, xMax - c)
-            if hw < 0.35 * halfWin:
-                return None
-        a, b = int(max(0, np.floor(c - hw))), int(min(n, np.ceil(c + hw) + 1))
-        if b - a < 3:
-            return None
-        seg = grayRow[a:b].astype(np.float64)
-        wts = seg - seg.min()
-        if wts.sum() <= 0:
-            return None
-        c = a + float((wts * np.arange(b - a)).sum() / wts.sum())
-    return c
-
-
-def fringeRowCenters(rr, cnt, sc, lo, hi, pupil, refWidth=None):
-    # Center of a fringe in each of its rows (rr), from its white pixels: cnt = number,
-    # sc = sum of their columns, [lo, hi) = extent.
-    # Inside the pupil the center is the center of mass of the white pixels. Where the
-    # pupil border cuts the fringe, only part of its width is visible and the center of
-    # mass is pulled towards the pupil center; there the center is measured from the
-    # edge of the fringe that IS visible: (inner edge) +- (fringe width) / 2, with the
-    # width measured on the nearest rows that are not cut. A row is discarded (NaN) if
-    # the center obtained lies outside the pupil (the crest of the fringe is not in the
-    # image) or if the fringe is cut on both sides.
-    # Returns (centers, median width of the rows that are not cut or None).
-    center = sc / np.maximum(cnt, 1)
-    if pupil is None:
-        return center, None
-    pcx, pcy, pr = pupil
-    half = np.sqrt(np.maximum(pr ** 2 - (rr - pcy) ** 2, 0.0))
-    xL, xR = pcx - half, pcx + half
-    tol = max(3.0, EDGE_TOL * pr)
-    cutL, cutR = lo <= xL + tol, hi >= xR - tol
-    cut = cutL | cutR
-    span = (hi - lo).astype(np.float64)
-    free = np.where(~cut)[0]
-    width = float(np.median(span[free])) if len(free) >= EDGE_MIN_ROWS else None
-    if not cut.any():
-        return center, width
-    center = center.astype(np.float64).copy()
-    for i in np.where(cut)[0]:
-        if cutL[i] and cutR[i]:
-            center[i] = np.nan
-            continue
-        if width is not None:
-            near = free[np.argsort(np.abs(rr[free] - rr[i]))[:15]]
-            wRef = float(np.median(span[near]))
-        elif refWidth is not None:
-            wRef = float(refWidth)
-        else:
-            center[i] = np.nan
-            continue
-        wRef = max(wRef, span[i])
-        c = hi[i] - wRef / 2.0 if cutL[i] else lo[i] + wRef / 2.0
-        # at least 3/4 of the fringe must be visible
-        center[i] = c if (xL[i] + 0.25 * wRef <= c <= xR[i] - 0.25 * wRef) else np.nan
-    return center, width
-
-
-def bandAnchors(rr, cnt, center, nAnchors):
-    # Anchor points of a fringe: its rows are divided in nAnchors bands and the anchor
-    # point of each band is the mean of the row centers, weighted by the number of
-    # white pixels of each row (center of mass, Eqs. 14-15 of the manuscript)
-    ok = np.isfinite(center) & (cnt > 0)
-    rr, cnt, center = rr[ok], cnt[ok].astype(np.float64), center[ok]
-    if len(rr) < 2:
-        return [], None, None
-    firstRow, lastRow = int(rr[0]), int(rr[-1])
-    band = (lastRow - firstRow) // (nAnchors - 1)
-    if band < 2:
-        return [], firstRow, lastRow
-    anchors = []
-    for b in range(nAnchors):
-        if b == 0:
-            r0, r1 = firstRow, firstRow + max(band // 2, 1)
-        elif b == nAnchors - 1:
-            r0, r1 = lastRow - max(band // 2, 1), lastRow + 1
-        else:
-            r0 = firstRow + b * band - band // 2
-            r1 = r0 + band
-        sel = (rr >= r0) & (rr < r1)
-        if cnt[sel].sum() == 0:
-            continue
-        anchors.append((float((rr[sel] * cnt[sel]).sum() / cnt[sel].sum()),
-                        float((center[sel] * cnt[sel]).sum() / cnt[sel].sum())))
-    return anchors, firstRow, lastRow
-
-
-def getAnchorPoints(binImg, peaks, halfWidth, nAnchors=N_ANCHORS, gray=None, pupil=None):
-    # For each stripe, divide its vertical extent in nAnchors bands. The anchor point
-    # of each band is the mean of the sub-pixel intensity centroids of its rows
-    # (or the center of mass of the white pixels when no gray image is given).
+def getAnchorPoints(binImg, peaks, halfWidth, nAnchors=N_ANCHORS):
+    # For each stripe, divide its vertical extent in nAnchors bands and take
+    # the center of mass of the white pixels of each band as anchor point
     h, w = binImg.shape
-    if gray is None:
-        # Row data of every fringe inside its vertical window
-        data = []
-        for peakCol in peaks:
-            minCol = max(0, int(peakCol) - halfWidth)
-            maxCol = min(w, int(peakCol) + halfWidth)
-            strip = binImg[:, minCol:maxCol] > 0
-            rr = np.where(strip.any(axis=1))[0]
-            if len(rr) == 0 or strip.sum() < MIN_STRIPE_PIXELS:
-                continue
-            sub = strip[rr]
-            cnt = sub.sum(axis=1).astype(np.float64)
-            sc = (sub * np.arange(minCol, maxCol)).sum(axis=1).astype(np.float64)
-            lo = minCol + sub.argmax(axis=1)
-            hi = maxCol - sub[:, ::-1].argmax(axis=1)
-            data.append((int(peakCol), rr, cnt, sc, lo, hi))
-        return fringesFromRows(data, pupil, nAnchors)
     stripes = []
     for peakCol in peaks:
         minCol = max(0, int(peakCol) - halfWidth)
@@ -484,223 +297,12 @@ def getAnchorPoints(binImg, peaks, halfWidth, nAnchors=N_ANCHORS, gray=None, pup
             sub = strip[r0:r1]
             if sub.sum() == 0:
                 continue
-            if gray is None:
-                rr, cc = np.where(sub > 0)
-                anchors.append((r0 + rr.mean(), minCol + cc.mean()))
-                continue
-            pts, nRows = [], 0
-            for rr_ in range(r0, r1):
-                white = np.where(strip[rr_] > 0)[0]
-                if len(white) == 0:
-                    continue
-                nRows += 1
-                xMin = xMax = None
-                if pupil is not None:
-                    pcx, pcy, pr = pupil
-                    half = pr ** 2 - (rr_ - pcy) ** 2
-                    if half <= 0:
-                        continue
-                    half = np.sqrt(half) - 2.0
-                    xMin, xMax = pcx - half, pcx + half
-                cx_ = rowCentroid(gray[rr_], binImg[rr_], minCol + white.mean(),
-                                  0.75 * halfWidth, xMin, xMax)
-                if cx_ is not None:
-                    pts.append((rr_, cx_))
-            if pts and len(pts) >= 0.3 * max(nRows, 1):
-                pts = np.array(pts)
-                anchors.append((float(pts[:, 0].mean()), float(pts[:, 1].mean())))
-            # (bands where the fringe is cut by the pupil border give no anchor point:
-            #  their center would be biased; that zone is covered by the extension)
+            rr, cc = np.where(sub > 0)
+            anchors.append((r0 + rr.mean(), minCol + cc.mean()))
         # Accept the stripe only if it is continuous enough
-        minAnchors = MIN_GOOD_ANCHORS if gray is not None else nAnchors * 0.6
-        if len(anchors) >= minAnchors:
+        if len(anchors) >= nAnchors * 0.6:
             stripes.append({"peak": int(peakCol), "anchors": anchors})
     return stripes
-
-
-def fringesFromRows(data, pupil, nAnchors=N_ANCHORS, minChord=None):
-    # data: one (peak, rows, count, sum of columns, lo, hi) per fringe.
-    # Row centers (corrected where the pupil cuts the fringe) -> anchor points.
-    # A fringe that is cut by the pupil in all its rows takes the width of the nearest
-    # fringe that is not; it is kept only if its crest is inside the pupil.
-    first = [fringeRowCenters(rr, cnt, sc, lo, hi, pupil) for (_, rr, cnt, sc, lo, hi) in data]
-    xm = [float(sc.sum() / max(cnt.sum(), 1)) for (_, rr, cnt, sc, lo, hi) in data]
-    known = [(xm[i], first[i][1]) for i in range(len(data)) if first[i][1] is not None]
-    stripes = []
-    for i, (peak, rr, cnt, sc, lo, hi) in enumerate(data):
-        center = first[i][0]
-        others = [t for t in known if t[0] != xm[i]]
-        ref = min(others, key=lambda t: abs(t[0] - xm[i]))[1] if others else None
-        if pupil is not None and ref is not None:
-            if first[i][1] is None:
-                center, _ = fringeRowCenters(rr, cnt, sc, lo, hi, pupil, refWidth=ref)
-            elif (first[i][1] < EDGE_PARTIAL * ref and
-                  abs(xm[i] - pupil[0]) > pupil[2] - ref):
-                # Sliver next to the pupil border, much narrower than its neighbour:
-                # the visible part of a fringe whose crest is outside the pupil
-                continue
-        anchors, firstRow, lastRow = bandAnchors(rr, cnt, center, nAnchors)
-        # Accept the fringe only if it is continuous enough (and long enough)
-        if len(anchors) < nAnchors * 0.6:
-            continue
-        okc = np.isfinite(center)
-        meanCol = float((center[okc] * cnt[okc]).sum() / cnt[okc].sum())
-        if minChord is not None and pupil is not None:
-            half = pupil[2] ** 2 - (meanCol - pupil[0]) ** 2
-            chord = 2.0 * np.sqrt(half) if half > 0 else 0.0
-            if (lastRow - firstRow) < minChord * chord:
-                continue
-        stripes.append({"peak": int(peak) if peak is not None else int(round(meanCol)),
-                        "anchors": anchors})
-    return stripes
-
-
-def trackFringes(binImg, pupil=None, nAnchors=N_ANCHORS):
-    # Fringe following. Each fringe is located on the center row of the pupil and then
-    # followed upwards and downwards row by row: in every row the fringe is the white
-    # run (or runs) connected to its extent in the previous row. The search therefore
-    # moves with the fringe, so curved or S-shaped fringes are followed along their
-    # whole length (a fixed vertical window only works for nearly vertical fringes).
-    # White regions that do not cross the center row are followed from their own middle
-    # row. The anchor points are, as before, the center of mass of the white pixels of
-    # the fringe in nAnchors bands along its length (Eqs. 14-15 of the manuscript).
-    h, w = binImg.shape
-    white = binImg > 0
-    claimed = np.zeros((h, w), dtype=bool)
-    cy = int(round(pupil[1])) if pupil is not None else h // 2
-    cy = min(max(cy, 0), h - 1)
-    size = 2.0 * pupil[2] if pupil is not None else float(h)
-    maxGap = max(12, int(0.12 * size))        # rows without white pixels tolerated
-
-    def rowRuns(r):
-        row = white[r] & ~claimed[r]
-        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
-        return np.where(d == 1)[0], np.where(d == -1)[0]
-
-    def follow(r0, L0, R0):
-        rows = {}
-        for direction in (1, -1):
-            L, R, wS, gap = L0, R0, float(R0 - L0), 0
-            r = r0 if direction == 1 else r0 - 1
-            while 0 <= r < h:
-                st, en = rowRuns(r)
-                m = 2 + 0.5 * gap
-                sel = (en > L - m) & (st < R + m)
-                found = False
-                if sel.any():
-                    a, b = int(st[sel].min()), int(en[sel].max())
-                    if (b - a) > 1.6 * wS + 4:
-                        # Two fringes touch in the binary image: keep only the part
-                        # that continues this fringe
-                        a, b = max(a, int(L - 0.25 * wS)), min(b, int(R + 0.25 * wS))
-                    cols = np.where(white[r, a:b] & ~claimed[r, a:b])[0] + a
-                    if len(cols):
-                        rows[r] = (float(cols.sum()), len(cols), int(cols.min()),
-                                   int(cols.max()) + 1)
-                        claimed[r, a:b] = True
-                        L, R = int(cols.min()), int(cols.max()) + 1
-                        wS = 0.8 * wS + 0.2 * (R - L)
-                        gap, found = 0, True
-                if not found:
-                    gap += 1
-                    if gap > maxGap:
-                        break
-                r += direction
-        return rows
-
-    # Seeds: white runs of the center row (averaged over a few rows)
-    band = max(2, int(0.01 * size))
-    seedRow = white[max(0, cy - band):min(h, cy + band + 1)].mean(axis=0) > 0.5
-    d = np.diff(np.concatenate(([0], seedRow.astype(np.int8), [0])))
-    fringes = [follow(cy, int(a), int(b))
-               for a, b in zip(np.where(d == 1)[0], np.where(d == -1)[0]) if b - a >= 2]
-    # White regions that do not cross the center row
-    for _ in range(60):
-        rest = (white & ~claimed).astype(np.uint8)
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(rest)
-        if n <= 1:
-            break
-        k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        if stats[k, cv2.CC_STAT_AREA] < MIN_STRIPE_PIXELS:
-            break
-        ys = np.where((labels == k).any(axis=1))[0]
-        rm = int(ys[len(ys) // 2])
-        xs = np.where(labels[rm] == k)[0]
-        rows = follow(rm, int(xs.min()), int(xs.max()) + 1)
-        if not rows:
-            claimed[labels == k] = True
-            continue
-        fringes.append(rows)
-
-    data = []
-    for rows in fringes:
-        if not rows:
-            continue
-        rr = np.array(sorted(rows))
-        sc = np.array([rows[r][0] for r in rr], dtype=np.float64)
-        cnt = np.array([rows[r][1] for r in rr], dtype=np.float64)
-        if cnt.sum() < MIN_STRIPE_PIXELS:
-            continue
-        lo = np.array([rows[r][2] for r in rr])
-        hi = np.array([rows[r][3] for r in rr])
-        data.append((None, rr, cnt, sc, lo, hi))
-    stripes = fringesFromRows(data, pupil, nAnchors, minChord=MIN_FRINGE_CHORD)
-    stripes.sort(key=lambda s_: float(np.mean([p[1] for p in s_["anchors"]])))
-    return stripes
-
-
-def windowLeaveFraction(binImg, peaks, halfWidth):
-    # Fraction of the rows of the fringes in which the white pixels touch the left or
-    # right border of the vertical search window: low for nearly vertical fringes,
-    # high when the fringes are curved and leave the window
-    h, w = binImg.shape
-    touched = total = 0
-    for p in peaks:
-        a, b = max(0, int(p) - halfWidth), min(w, int(p) + halfWidth)
-        if b - a < 2:
-            continue
-        strip = binImg[:, a:b] > 0
-        rows = strip.any(axis=1)
-        total += int(rows.sum())
-        touched += int((strip[:, 0] | strip[:, -1])[rows].sum())
-    return touched / max(total, 1)
-
-
-def detectFringes(binImg, pupil, peaks, halfWidth, gray=None):
-    # Anchor points of the fringes.
-    #  - Nearly vertical fringes (the case of the Ronchi-SLM setup): vertical search
-    #    window around each peak of the column profile, as described in the manuscript.
-    #  - Curved fringes (they leave their windows) or no valid peaks: fringe following.
-    # Returns (stripes, method, fraction of rows leaving the windows).
-    leave = None
-    if len(peaks) >= 2:
-        leave = windowLeaveFraction(binImg, peaks, halfWidth)
-        if leave <= WINDOW_LEAVE_MAX:
-            stripes = getAnchorPoints(binImg, peaks, halfWidth, pupil=pupil, gray=gray)
-            if len(stripes) >= 2:
-                return stripes, "vertical windows on the column-profile peaks", leave
-    return trackFringes(binImg, pupil), "fringe following (curved fringes)", leave
-
-
-def fitCenterline(rows, cols, maxDegree=None):
-    # Polynomial x = p(y) through the anchor points. The degree goes from POLY_DEGREE
-    # to POLY_MAX_DEGREE and is chosen with the Bayesian information criterion, so a
-    # higher degree is used only when the residual really decreases.
-    rows, cols = np.asarray(rows, float), np.asarray(cols, float)
-    n = len(rows)
-    best, bestBic = None, np.inf
-    if maxDegree is None:
-        maxDegree = POLY_MAX_DEGREE
-    for d in range(POLY_DEGREE, maxDegree + 1):
-        if n < d + 3 and d > POLY_DEGREE:
-            break
-        dd = min(d, n - 1)
-        poly = np.poly1d(np.polyfit(rows, cols, dd))
-        rss = float(np.sum((poly(rows) - cols) ** 2)) + 1e-12
-        bic = n * np.log(rss / n) + (dd + 1) * np.log(n)
-        if bic < bestBic - 2.0 or best is None:      # require a clear improvement
-            best, bestBic = poly, bic
-    return best
 
 
 def fringePositions(smooth, stripes, halfWidth):
@@ -721,8 +323,7 @@ def fringePositions(smooth, stripes, halfWidth):
     return np.sort(pos)
 
 
-def buildCentroidLines(binImg, peaks, medianGap, pupil, stripes=None, halfWidth=None,
-                       maxDegree=None):
+def buildCentroidLines(binImg, peaks, medianGap, pupil, stripes=None, halfWidth=None):
     # Centroid line of each stripe: polynomial through its anchor points,
     # sampled every POINT_STEP px (rows aligned to multiples of POINT_STEP)
     # and restricted to the exit pupil. If 'stripes' is given (anchor points
@@ -737,7 +338,7 @@ def buildCentroidLines(binImg, peaks, medianGap, pupil, stripes=None, halfWidth=
         cols = np.array([p[1] for p in s["anchors"]])
         if len(rows) < POLY_DEGREE + 1:
             continue
-        poly = fitCenterline(rows, cols, maxDegree)
+        poly = np.poly1d(np.polyfit(rows, cols, POLY_DEGREE))
         ys = np.arange(np.ceil(rows.min() / POINT_STEP) * POINT_STEP,
                        rows.max() + 1e-9, POINT_STEP, dtype=np.float64)
         xs = poly(ys)
@@ -845,159 +446,24 @@ def buildTheoreticalRonchigram(shape, pupil, xc, spacing, width, mapping):
     return theo, nLines
 
 
-def theoreticalLines(shape, pupil, xc, spacing, mapping, kNeed=0):
-    # Analytic centers of the theoretical stripes (manuscript: x_k = x_0 + k * lambda_exp),
-    # mapped to the camera plane with the ideal ray mapping of the surface. For every
-    # row, the camera abscissa whose entrance coordinate equals u_k is found exactly
-    # (Newton), and a smooth polynomial in y is fitted to those points.
-    # Every line keeps its order k and a function "exact" that gives its abscissa at
-    # any row. Orders up to +-kNeed are returned even if they fall outside the pupil
-    # ("outside": True): the ideal ruling continues there (the ray mapping is continued
-    # linearly beyond the edge) and those lines are the reference of the outer fringes
-    # when the aberrations displace them towards the center.
-    h, w = shape
-    cx, cy, r = pupil
-    m0 = mapping["m0"]
-    p = spacing / r / m0
-    d0 = (xc - cx) / r
-    u0 = d0 * (camToEntrance(mapping, abs(d0)) / abs(d0) if abs(d0) > 1e-9 else 1.0 / m0)
-
-    edgeSlope = float((mapping["rhoIn"][-1] - mapping["rhoIn"][-2]) /
-                      (mapping["rhoCam"][-1] - mapping["rhoCam"][-2]))
-
-    def entrance(dx, dy):
-        rc = np.hypot(dx, dy)
-        rin = np.where(rc <= 1.0, camToEntrance(mapping, np.minimum(rc, 1.0)),
-                       1.0 + (rc - 1.0) * edgeSlope)
-        sc = np.where(rc > 1e-12, rin / np.maximum(rc, 1e-12), 1.0 / m0)
-        return dx * sc
-
-    def solve(uk, dy):
-        dx = np.full_like(dy, uk * m0)
-        for _ in range(30):
-            f = entrance(dx, dy) - uk
-            der = (entrance(dx + 1e-6, dy) - entrance(dx - 1e-6, dy)) / 2e-6
-            dx = dx - f / np.where(np.abs(der) > 1e-9, der, 1.0)
-        return dx
-
-    ys = np.arange(np.ceil(cy - r), np.floor(cy + r) + 1, 1.0)
-    dy = (ys - cy) / r
-    lines = []
-    if not np.isfinite(p) or p <= 0:
-        raise RuntimeError("The fringe spacing is zero: the theoretical Ronchigram cannot "
-                           "be built. Review the fringes.")
-    kMax = max(int(np.ceil(1.0 / p)) + 1, int(kNeed))
-    for k in range(-kMax, kMax + 1):
-        uk = u0 + k * p
-        dx = solve(uk, dy)
-        ok = dx ** 2 + dy ** 2 <= 1.0
-        exact = (lambda yq, uk=uk: cx + r * solve(uk, (np.asarray(yq, dtype=np.float64) - cy) / r))
-        if abs(uk) >= 1.0 or ok.sum() < 3:
-            if abs(k) > kNeed:
-                continue
-            xk = cx + dx * r
-            poly = np.polynomial.Polynomial.fit(ys, xk, min(8, len(ys) - 1))
-            lines.append({"poly": poly, "anchors": [], "ys": np.array([]), "xs": np.array([]),
-                          "a0": float(ys.min()), "a1": float(ys.max()), "width": np.nan,
-                          "xMean": float(xk.mean()), "k": k, "exact": exact, "outside": True})
-            continue
-        yk, xk = ys[ok], cx + dx[ok] * r
-        poly = np.polynomial.Polynomial.fit(yk, xk, min(8, len(yk) - 1))
-        a0, a1 = float(yk.min()), float(yk.max())
-        ysS = np.arange(np.ceil(a0 / POINT_STEP) * POINT_STEP, a1 + 1e-9, POINT_STEP)
-        xsS = poly(ysS)
-        okS = insidePupil(xsS, ysS, pupil)
-        lines.append({"poly": poly, "anchors": [], "ys": ysS[okS], "xs": xsS[okS],
-                      "a0": a0, "a1": a1, "width": np.nan, "xMean": float(xk.mean()),
-                      "k": k, "exact": exact, "outside": False})
-    lines.sort(key=lambda L: L["xMean"])
-    return lines
-
-
 def centralIndex(lines, cx, cy):
     # Index of the line passing closest to the pupil center
     return int(np.argmin([abs(L["poly"](cy) - cx) for L in lines]))
 
 
-def fringesBetween(binImg, LA, LB):
-    # Number of fringes of the binary image lying between two detected fringes (0 for
-    # consecutive fringes): white runs found, row by row, in the middle of the gap
-    # between both centroid lines. The median over the rows is taken.
-    a0, a1 = max(LA["a0"], LB["a0"]), min(LA["a1"], LB["a1"])
-    if a1 - a0 < 4:
-        return 0
-    h, w = binImg.shape
-    counts = []
-    for y in np.arange(np.ceil(a0), a1, 2.0):
-        r = int(round(y))
-        if not 0 <= r < h:
-            continue
-        xa, xb = sorted((float(LA["poly"](y)), float(LB["poly"](y))))
-        if xb - xa < 6:
-            continue
-        i0, i1 = max(0, int(np.floor(xa))), min(w, int(np.ceil(xb)) + 1)
-        row = binImg[r, i0:i1] > 0
-        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
-        mid = i0 + 0.5 * (np.where(d == 1)[0] + np.where(d == -1)[0] - 1)
-        length = np.where(d == -1)[0] - np.where(d == 1)[0]
-        t = (mid - xa) / (xb - xa)
-        counts.append(int(np.sum((t > 0.2) & (t < 0.8) & (length >= 2))))
-    return int(round(float(np.median(counts)))) if counts else 0
-
-
-def fringeOrders(expLines, binImg, ie0, cy, spacing=None):
-    # Order of every fringe counted from the central one (order 0), as in the classical
-    # theory of the Ronchi test (Optical Shop Testing, Eq. 9.3: each fringe is one line
-    # of the ruling, order m). Neighbouring fringes differ by one order whatever their
-    # separation, so fringes compressed or spread by the aberrations keep their order.
-    # Orders are skipped only where a fringe is missing from the list (not detected, or
-    # deleted in the review): the binary image shows a fringe between two of them AND
-    # their separation is about twice (or more) that of the neighbouring fringes.
-    pos = [float(L["poly"](min(max(cy, L["a0"]), L["a1"]))) for L in expLines]
-    seq = list(np.argsort(pos))
-    gaps = [pos[seq[j + 1]] - pos[seq[j]] for j in range(len(seq) - 1)]
-    step = []
-    for j, g in enumerate(gaps):
-        n = fringesBetween(binImg, expLines[seq[j]], expLines[seq[j + 1]])
-        if n > 0:
-            ref = [gaps[i] for i in (j - 1, j + 1) if 0 <= i < len(gaps)]
-            if spacing:
-                ref.append(float(spacing))
-            ref = min(ref) if ref else g
-            n = min(n, max(int(round(g / ref)) - 1, 0)) if ref > 0 else 0
-        step.append(1 + n)
-    c = seq.index(ie0)
-    order = {ie0: 0}
-    for j in range(c + 1, len(seq)):
-        order[seq[j]] = order[seq[j - 1]] + step[j - 1]
-    for j in range(c - 1, -1, -1):
-        order[seq[j]] = order[seq[j + 1]] - step[j]
-    return order
-
-
 def lineDifferences(expLines, theoLines, pairs, pupil):
     # Point-to-point difference between corresponding experimental and theoretical
-    # centroid lines, at the same rows (both positions are kept; TA_POSITION selects
-    # which one locates the value in the pupil).
+    # centroid lines, at the same rows. Position = theoretical point.
     rows = []
     for k, (ie, it) in enumerate(pairs):
         E, T = expLines[ie], theoLines[it]
-        if TA_POSITION == "experimental":
-            # Every point of the measured fringe is compared with the ideal position
-            # of the same order at the same row (also where the ideal line leaves the pupil)
-            ys = np.arange(np.ceil(E["a0"] / POINT_STEP) * POINT_STEP, E["a1"] + 1e-9,
-                           POINT_STEP, dtype=np.float64)
-            xE = E["poly"](ys)
-            xT = T["exact"](ys)
-            ok = insidePupil(xE, ys, pupil)
-        else:
-            a0 = max(E["a0"], T["a0"])
-            a1 = min(E["a1"], T["a1"])
-            ys = np.arange(np.ceil(a0 / POINT_STEP) * POINT_STEP, a1 + 1e-9,
-                           POINT_STEP, dtype=np.float64)
-            xE = E["poly"](ys)
-            xT = T["poly"](ys)
-            ok = insidePupil(xT, ys, pupil) & ~np.asarray(T.get("outside", False))
+        a0 = max(E["a0"], T["a0"])
+        a1 = min(E["a1"], T["a1"])
+        ys = np.arange(np.ceil(a0 / POINT_STEP) * POINT_STEP, a1 + 1e-9,
+                       POINT_STEP, dtype=np.float64)
+        xE = E["poly"](ys)
+        xT = T["poly"](ys)
+        ok = insidePupil(xT, ys, pupil)
         for y, xe, xt in zip(ys[ok], xE[ok], xT[ok]):
             rows.append({"line": k, "expIdx": ie, "theoIdx": it,
                          "along": float(y), "acrossTheo": float(xt),
@@ -1020,7 +486,7 @@ def adjustMin(df, col="diffRaw"):
 # ══════════════════════════════════════════════════════════════════════════════
 def plotDiffMap(df, title, pupil, shape, value="diffAdj", outline=None,
                 cbarLabel="TA, adjusted to min = 0 (px)"):
-    # Point cloud: positions = measured points, color (intensity) = adjusted difference
+    # Point cloud: positions = theoretical points, color (intensity) = adjusted difference
     # outline: optional (N, 2) polygon drawn in cyan (border of the measured region)
     fig, ax = plt.subplots(figsize=(8, 8))
     if len(df) > 3000:
@@ -1117,99 +583,6 @@ def plotPeaks(smooth, peaksR, peaks, removed, axisLabel):
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — VERTICAL ALIGNMENT VERIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
-def stripeOrientation(rgb, pupil=None):
-    # Global orientation of the fringes, for any inclination (Sec. 3.1: Canny + Hough,
-    # median of the orientations).
-    # The edges are taken from the BINARIZED fringes, not from the gray image: smooth
-    # (sinusoidal) fringes have no sharp edges and Canny finds almost nothing on them,
-    # while the binary fringes always have well-defined borders.
-    # The orientation of a line is an axial quantity (theta and theta + 180 are the
-    # same line), so the segments are averaged with the doubled angle and the median
-    # is taken around that mean; this also works for nearly horizontal fringes, where
-    # a plain median of the angles breaks at the wrap-around.
-    # Returns (rotation in degrees that makes the fringes vertical, number of segments,
-    # method used).
-    # 1) Hough on the edges of the image itself (sharp fringes, as in real Ronchigrams)
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    edges0 = cv2.Canny(cv2.GaussianBlur(bgr, (5, 5), 0), 30, 100, apertureSize=3)
-    lines0 = cv2.HoughLinesP(edges0, 1, np.pi / 180, threshold=100,
-                             minLineLength=100, maxLineGap=20)
-    imageRot, nImage = None, 0
-    if lines0 is not None:
-        a0 = []
-        for x1, y1, x2, y2 in lines0.reshape(-1, 4):
-            a = np.degrees(np.arctan2(y1 - y2, x1 - x2))
-            # Endpoint order is arbitrary: normalize to (-180, 0] (vertical = -90)
-            a0.append((a % 180) - 180 if a % 180 != 0 else 0.0)
-        imageRot, nImage = float(np.median(a0)) + 90.0, len(a0)
-
-    # 2) Hough on the binarized fringes (smooth fringes have no sharp edges)
-    _, _, _, closed = binarizeStripes(rgb)
-    h, w = closed.shape
-    if pupil is None:
-        try:
-            pupil = detectPupil(rgb)
-        except RuntimeError:
-            pupil = None
-    inner = None
-    if pupil is not None:
-        closed = cv2.bitwise_and(closed, circleMask((h, w), pupil))
-        # The arcs where the fringes are cut by the pupil border are not fringe edges
-        inner = circleMask((h, w), (pupil[0], pupil[1], 0.96 * pupil[2]))
-    edges = cv2.Canny(closed, 50, 150)
-    if inner is not None:
-        edges[inner == 0] = 0
-    size = min(h, w) if pupil is None else 2.0 * pupil[2]
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=max(25, int(0.10 * size)),
-                            minLineLength=max(25, int(0.15 * size)),
-                            maxLineGap=max(5, int(0.03 * size)))
-    ang, wts = [], []
-    if lines is not None:
-        # Depending on the OpenCV version the shape is (N, 1, 4) or (N, 4)
-        for x1, y1, x2, y2 in lines.reshape(-1, 4):
-            ang.append(np.degrees(np.arctan2(y1 - y2, x1 - x2)) % 180.0)
-            wts.append(np.hypot(x1 - x2, y1 - y2))
-    # Dominant direction of the intensity gradient inside the pupil (structure tensor):
-    # the fringes are perpendicular to it. It uses the whole image, so it is also right
-    # for strongly curved fringes, where the Hough segments are only the slanted parts.
-    gray = cv2.GaussianBlur(stripeChannel(rgb).astype(np.float32), (0, 0), 2.0)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    if inner is not None:
-        gx, gy = gx[inner > 0], gy[inner > 0]
-    jxx, jyy, jxy = float((gx * gx).sum()), float((gy * gy).sum()), float((gx * gy).sum())
-    gradDir = (0.5 * np.degrees(np.arctan2(2.0 * jxy, jxx - jyy)) + 90.0
-               if jxx + jyy > 0 else None)
-
-    houghDir = None
-    if len(ang) >= 3:
-        ang, wts = np.array(ang), np.array(wts)
-        d = np.radians(2.0 * ang)
-        mean = 0.5 * np.degrees(np.arctan2((wts * np.sin(d)).sum(), (wts * np.cos(d)).sum()))
-        dev = ((ang - mean + 90.0) % 180.0) - 90.0
-        houghDir = mean + float(np.median(dev))
-
-    def agrees(direction_):
-        # A Hough estimate is trusted only if it agrees with the gradient orientation
-        return gradDir is None or abs(((direction_ - gradDir + 90.0) % 180.0) - 90.0) <= 3.0
-
-    if imageRot is not None and agrees(imageRot + 90.0):
-        return imageRot, nImage, "Hough on the image edges"
-    if houghDir is not None and agrees(houghDir):
-        direction, method = houghDir, "Hough on the binarized fringes (smooth fringes)"
-    elif gradDir is not None:
-        direction = gradDir
-        method = ("gradient orientation (curved fringes: the Hough segments disagree)"
-                  if (houghDir is not None or imageRot is not None)
-                  else "gradient orientation (no Hough segments)")
-    else:
-        return 0.0, 0, "no fringes found (image not rotated)"
-    # direction: axial angle of the fringes (vertical = 90). Smallest rotation that
-    # makes them vertical, in (-90, 90]
-    rotation = ((direction - 90.0 + 90.0) % 180.0) - 90.0
-    return float(rotation), len(ang), method
-
-
 def measureCentralInclination(rgb, pupil=None):
     # Residual inclination of the central stripes (Eq. 10 of the manuscript).
     # Each central stripe is represented by its anchor points along its whole length
@@ -1223,16 +596,8 @@ def measureCentralInclination(rgb, pupil=None):
     cx, cy, _ = pupil
     binImg = cv2.bitwise_and(binImg, circleMask(binImg.shape, pupil))
     _, smooth = columnProfile(binImg)
-    try:
-        _, peaks, gap, _, _ = detectStripePeaks(smooth)
-        halfWidth = max(int(gap * 0.4), 10)
-    except RuntimeError:
-        peaks, gap, halfWidth = np.array([], int), None, max(int(0.15 * pupil[2]), 10)
-    stripes, _, _ = detectFringes(binImg, pupil, peaks, halfWidth)
-    if len(stripes) < 2:
-        raise RuntimeError("Fewer than 2 fringes found to verify the alignment.")
-    lines, _ = buildCentroidLines(binImg, peaks, gap, pupil, stripes=stripes,
-                                  halfWidth=halfWidth)
+    _, peaks, gap, _, _ = detectStripePeaks(smooth)
+    lines, _ = buildCentroidLines(binImg, peaks, gap, pupil)
     # The ALIGN_N_CENTRAL stripes closest to the pupil center (least aberration effect)
     central = sorted(lines, key=lambda L: abs(L["poly"](cy) - cx))[:ALIGN_N_CENTRAL]
     measures = []
@@ -1251,23 +616,13 @@ def measureCentralInclination(rgb, pupil=None):
     return float(np.median([m["angle"] for m in measures])), measures
 
 
-def verifyVerticalAlignment(rgb0, baseAngle=0.0, pupil=None):
-    # Refines the orientation until the residual inclination of the central stripes
-    # is below ANGLE_THRESHOLD. Every measurement rotates the ORIGINAL image by the
-    # total angle (Hough + corrections), so the rotations are never accumulated
-    # (each resampling would smooth the fringes a little more).
+def verifyVerticalAlignment(rgb, pupil=None):
+    # Iteratively corrects the residual inclination until it is below ANGLE_THRESHOLD
     history = []
-    total = float(baseAngle)
-    h0, w0 = rgb0.shape[:2]
-    rgb = rotateImage(rgb0, total)
+    totalCorrection = 0.0
     for it in range(ALIGN_MAX_ITER + 1):
-        pup = None
-        if pupil is not None:
-            M = cv2.getRotationMatrix2D((w0 / 2, h0 / 2), total, 1.0)
-            pcx, pcy = (M @ np.array([pupil[0], pupil[1], 1.0])).tolist()
-            pup = (pcx, pcy, pupil[2])
         try:
-            angle, measures = measureCentralInclination(rgb, pup)
+            angle, measures = measureCentralInclination(rgb, pupil)
         except RuntimeError:
             # Too few stripes detected automatically (e.g. a dim Ronchigram):
             # the check is skipped and the Hough orientation is kept
@@ -1276,9 +631,8 @@ def verifyVerticalAlignment(rgb0, baseAngle=0.0, pupil=None):
         if abs(angle) <= ANGLE_THRESHOLD or it == ALIGN_MAX_ITER:
             break
         # Rotating by -angle cancels the inclination of the stripes
-        total -= angle
-        rgb = rotateImage(rgb0, total)
-    totalCorrection = total - float(baseAngle)
+        rgb = rotateImage(rgb, -angle)
+        totalCorrection += -angle
 
     # Visualization: extremes of the central stripes and a vertical reference line
     vis = rgb.copy()
@@ -1306,7 +660,7 @@ def verifyVerticalAlignment(rgb0, baseAngle=0.0, pupil=None):
 # STEP 2 — ANALYSIS OF ONE RONCHIGRAM (vertical or horizontal)
 # ══════════════════════════════════════════════════════════════════════════════
 def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapping,
-                      editor=None, stripesOverride=None, maxDegree=None):
+                      editor=None, stripesOverride=None):
     # Same algorithm for both orientations. The horizontal Ronchigram is analyzed
     # on its transpose (stripes become vertical) and the results are transposed back,
     # so the output is expressed in the coordinates of the rotated image.
@@ -1352,10 +706,12 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
                     f"Final stripes: {len(peaks)}",
                     f"Median gap (spacing): {gap:.3f} px"]
     except RuntimeError as ex:
-        # No valid peaks in the column profile (e.g. strongly curved fringes): the
-        # fringes are found by fringe following
+        # Fewer than 2 stripes found automatically: allowed only when the user
+        # reviews the fringes (or they come from the vertical review)
+        if editor is None and stripesOverride is None:
+            raise
         peaksR, peaks, gap, removed = np.array([], int), np.array([], int), None, []
-        peakText = [f"Column profile: {ex}"]
+        peakText = [f"Automatic detection: {ex}"]
     results.append({"title": "Intensity Profile" + tag,
                     "image": plotProfile(profile, smooth, axisLabel)})
     results.append({"title": "Peaks Detection" + tag,
@@ -1365,55 +721,21 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
 
     # ── Anchor points: automatic, then reviewed by the user ──
     halfWidth = max(int(gap * 0.4), 10) if gap else max(int(0.15 * rP), 10)
-
-    def curvedBinary():
-        # Curved fringes: the closing must not merge neighbouring fringes that the
-        # aberrations bring very close together (near the pupil border), so it is
-        # repeated with a kernel elongated along the fringes
-        c = cv2.bitwise_and(binarizeStripes(work, CURVED_CLOSE_KERNEL)[3], pMask)
-        for r_ in results:
-            if r_["title"] == "Closed Stripes inside Pupil" + tag:
-                r_["image"] = out(c)
-                r_["text"] = [f"Curved fringes: closing of {CURVED_CLOSE_KERNEL[0]} x "
-                              f"{CURVED_CLOSE_KERNEL[1]} px (along the fringes), so "
-                              f"neighbouring fringes are not merged"]
-        return c
-
     if stripesOverride is not None:
         stripes = stripesOverride
         anchorText = ["Anchor points: the fringes confirmed in the vertical Ronchigram, "
                       "rotated 90° (same fringes)"]
-        if maxDegree == CURVED_MAX_DEGREE:
-            closed = curvedBinary()
     else:
-        stripes, detMethod, leave = detectFringes(
-            closed, pup, peaks, halfWidth,
-            gray=stripeChannel(work) if SUBPIXEL_ANCHORS else None)
-        if detMethod.startswith("fringe following"):
-            maxDegree = CURVED_MAX_DEGREE
-            closedC = curvedBinary()
-            stripesC = trackFringes(closedC, pup)
-            closed = closedC
-            if len(stripesC) >= 2:
-                stripes = stripesC
-        if gap is None and len(stripes) >= 2:
-            # Spacing from the detected fringes when the column profile has no peaks
-            cols_ = np.sort([np.mean([p[1] for p in s_["anchors"]]) for s_ in stripes])
-            halfWidth = max(int(0.4 * float(np.median(np.diff(cols_)))), 10)
-        anchorText = [f"Detection: {detMethod}",
-                      f"Half-width of search window: {halfWidth} px",
+        stripes = getAnchorPoints(closed, peaks, halfWidth) if len(peaks) else []
+        anchorText = [f"Half-width of search window: {halfWidth} px",
                       f"Automatically detected stripes: {len(stripes)}"]
-        if leave is not None:
-            anchorText.insert(1, f"Rows where a fringe leaves its vertical window: "
-                                 f"{100 * leave:.0f} % (limit {100 * WINDOW_LEAVE_MAX:.0f} %)")
     if editor is not None:
         nAuto = len(stripes)
         stripes = editor({"image": work, "stripes": stripes, "pupil": pup,
                           "halfWidth": halfWidth, "channel": stripeChannel(work)})
         if stripes is None:
             raise RuntimeError("Pipeline cancelled by the user in the fringe review.")
-        anchorText = [t_ for t_ in anchorText if t_.startswith(("Detection", "Rows where"))] + \
-                     [f"Automatically detected fringes: {nAuto}",
+        anchorText = [f"Automatically detected fringes: {nAuto}",
                       f"Fringes confirmed by the user: {len(stripes)}",
                       "Anchor points shown: the ones confirmed by the user"]
 
@@ -1434,7 +756,7 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
             rr = np.array([p[0] for p in s_["anchors"]])
             cc = np.array([p[1] for p in s_["anchors"]])
             if len(rr) > POLY_DEGREE:
-                drawCurve(vis, fitCenterline(rr, cc, maxDegree), rr.min(), rr.max(),
+                drawCurve(vis, np.poly1d(np.polyfit(rr, cc, POLY_DEGREE)), rr.min(), rr.max(),
                           col, 2)
             for (ar, ac) in s_["anchors"]:
                 cv2.circle(vis, (int(round(ac)), int(round(ar))), 6, (255, 255, 255), -1)
@@ -1448,23 +770,12 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
 
     # ── Experimental centroid lines (from the confirmed anchor points) ──
     expLines, halfWidth = buildCentroidLines(closed, peaks, gap, pup, stripes=stripes,
-                                             halfWidth=halfWidth, maxDegree=maxDegree)
+                                             halfWidth=halfWidth)
     if len(expLines) < 2:
         raise RuntimeError(f"{label}: at least 2 fringes (with at least "
                            f"{POLY_DEGREE + 1} anchor points each) are needed.")
     # Spacing of the confirmed fringes (same definition as the automatic detection)
     gap = float(np.median(np.diff(fringePositions(smooth, stripes, halfWidth))))
-    if maxDegree == CURVED_MAX_DEGREE or not np.isfinite(gap) or gap < 2.0:
-        # Curved fringes: the column profile does not separate them (several fringes
-        # share the same maximum, which would give a spacing of zero). The spacing is
-        # the median separation of the centroid lines on the center row.
-        pos_ = np.sort([float(L["poly"](min(max(cy, L["a0"]), L["a1"]))) for L in expLines])
-        sep_ = np.diff(pos_)
-        sep_ = sep_[sep_ > 0.5]
-        if len(sep_) == 0:
-            raise RuntimeError(f"{label}: the fringe spacing could not be measured "
-                               "(the confirmed fringes coincide). Review the fringes.")
-        gap = float(np.median(sep_))
     expWidth = float(np.nanmedian([L["width"] for L in expLines]))
     if not np.isfinite(expWidth):
         expWidth = 0.4 * gap
@@ -1497,42 +808,30 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
                              f"Reference (central) stripe at: {xc:.3f} px",
                              f"Theoretical stripes: {nTheo}"]})
 
-    # Theoretical centroid lines: analytic centers of the ideal stripes
-    # (the order of every experimental fringe is counted first, so the theoretical
-    #  lines of all those orders are available)
-    orders = fringeOrders(expLines, closed, ie0, cy, gap)
-    theoLines = theoreticalLines((h, w), pup, xc, gap, mapping,
-                                 kNeed=max(abs(o) for o in orders.values()))
-    byOrder = {L["k"]: i for i, L in enumerate(theoLines)}
+    # Same centroid recognition applied to the theoretical Ronchigram
+    _, tSmooth = columnProfile(theoBin)
+    _, tPeaks, tGap, _, _ = detectStripePeaks(tSmooth)
+    theoLines, _ = buildCentroidLines(theoBin, tPeaks, tGap, pup)
+    it0 = centralIndex(theoLines, xc, cy)
 
     vis = cv2.cvtColor(theoBin, cv2.COLOR_GRAY2RGB)
     for L in theoLines:
-        if L["outside"]:
-            continue
         drawCurve(vis, L["poly"], L["a0"], L["a1"], (255, 0, 0), 2)
         for x, y in zip(L["xs"], L["ys"]):
             cv2.circle(vis, (int(round(x)), int(round(y))), 2, (0, 120, 255), -1)
-    nInside = sum(1 for L in theoLines if not L["outside"])
-    theoText = [f"Recognized theoretical lines: {nInside}"]
-    if nInside < len(theoLines):
-        theoText.append(f"Lines of the ideal ruling beyond the pupil border, used as "
-                        f"reference of the outer fringes: {len(theoLines) - nInside}")
     results.append({"title": "Theoretical Centroid Lines" + tag, "image": out(vis),
-                    "text": theoText})
+                    "text": [f"Recognized theoretical lines: {len(theoLines)}"]})
     step(0.7)
 
     # ── Correspondence by order, counted from the central stripe ──
-    # Fringe m of the Ronchigram corresponds to line m of the theoretical one
-    # (consecutive orders; orders are skipped only where the binary image shows a
-    # fringe that is not in the list, so a deleted fringe does not shift the rest)
+    # The order of each fringe is its position relative to the central one in
+    # units of the spacing, so a missing or deleted fringe does not shift the rest
     pairs = []
     for ie, L in enumerate(expLines):
-        it = byOrder.get(orders[ie])
-        if it is None or it in [q[1] for q in pairs]:
-            continue
-        if TA_POSITION != "experimental" and theoLines[it]["outside"]:
-            continue
-        pairs.append((ie, it))
+        k = int(round((L["poly"](cy) - xc) / gap))
+        it = it0 + k
+        if 0 <= it < len(theoLines) and it not in [q[1] for q in pairs]:
+            pairs.append((ie, it))
 
     dfT = lineDifferences(expLines, theoLines, pairs, pup)
     dfT = adjustMin(dfT)
@@ -1549,20 +848,16 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
     cv2.circle(vis, (int(round(cx)), int(round(cy))), int(round(rP)), (90, 90, 90), 1)
     results.append({"title": "Experimental vs Theoretical Correspondence" + tag,
                     "image": out(vis),
-                    "text": [f"Corresponding pairs: {len(pairs)}",
-                             "Fringe orders counted from the central fringe (order 0)"] +
-                            [f"  Exp. line {ie + 1} -> order {theoLines[it]['k']:+d}"
-                             + (" (ideal line beyond the pupil)" if theoLines[it]["outside"]
-                                else "") for ie, it in pairs]})
+                    "text": [f"Corresponding pairs: {len(pairs)}"] +
+                            [f"  Exp. line {ie + 1} -> Theo. line {it + 1}" for ie, it in pairs]})
 
     # ── Output in the frame of the analyzed image ──
-    across = dfT["acrossExp"] if TA_POSITION == "experimental" else dfT["acrossTheo"]
     if horizontal:
-        df = pd.DataFrame({"line": dfT["line"], "x": dfT["along"], "y": across,
+        df = pd.DataFrame({"line": dfT["line"], "x": dfT["along"], "y": dfT["acrossTheo"],
                            "yExp": dfT["acrossExp"], "yTheo": dfT["acrossTheo"],
                            "diffRaw": dfT["diffRaw"], "diffAdj": dfT["diffAdj"]})
     else:
-        df = pd.DataFrame({"line": dfT["line"], "x": across, "y": dfT["along"],
+        df = pd.DataFrame({"line": dfT["line"], "x": dfT["acrossTheo"], "y": dfT["along"],
                            "xExp": dfT["acrossExp"], "xTheo": dfT["acrossTheo"],
                            "diffRaw": dfT["diffRaw"], "diffAdj": dfT["diffAdj"]})
 
@@ -1583,7 +878,7 @@ def analyzeRonchigram(rgb, pupil, label, horizontal, results, prog, p0, p1, mapp
     step(1.0)
 
     return {"exp": expLines, "theo": theoLines, "pairs": pairs, "df": df,
-            "spacing": gap, "width": expWidth, "maxDegree": maxDegree,
+            "spacing": gap, "width": expWidth,
             "stripes": [{"peak": int(round(L["xMean"])), "anchors": L["anchors"]}
                         for L in expLines]}
 
@@ -1620,14 +915,10 @@ def buildGrid(V, H, pupil, shape):
         for kh, (ieH, itH) in enumerate(H["pairs"]):
             pe = intersectLines(V["exp"][ieV], H["exp"][ieH])
             pt = intersectLines(V["theo"][itV], H["theo"][itH])
-            if pe is None or pt is None:
-                continue
-            pos = pe if TA_POSITION == "experimental" else pt
-            if not insidePupil(pos[0], pos[1], pupil):
+            if pe is None or pt is None or not insidePupil(pt[0], pt[1], pupil):
                 continue
             dx, dy = pe[0] - pt[0], pe[1] - pt[1]
-            rows.append({"lineV": kv, "lineH": kh, "x": pos[0], "y": pos[1],
-                         "xTheo": pt[0], "yTheo": pt[1],
+            rows.append({"lineV": kv, "lineH": kh, "x": pt[0], "y": pt[1],
                          "xExp": pe[0], "yExp": pe[1], "dx": dx, "dy": dy,
                          "diffRaw": float(np.hypot(dx, dy))})
     df = pd.DataFrame(rows)
@@ -1653,7 +944,7 @@ def buildGrid(V, H, pupil, shape):
             drawCurve(im, L["poly"], L["a0"], L["a1"], colH, 2, vertical=False)
     for _, r in df.iterrows():
         pe = (int(round(r["xExp"])), int(round(r["yExp"])))
-        pt = (int(round(r["xTheo"])), int(round(r["yTheo"])))
+        pt = (int(round(r["x"])), int(round(r["y"])))
         cv2.line(overlay, pe, pt, (230, 140, 0), 2)
         cv2.circle(overlay, pt, 5, (0, 0, 0), -1)
         cv2.circle(overlay, pe, 5, (150, 0, 200), -1)
@@ -2062,23 +1353,32 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
     prog(2)
 
     # ── Initial orientation with the Hough transform ──
+    blurred = cv2.GaussianBlur(bgrImg, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 100, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                            minLineLength=100, maxLineGap=20)
+    angles = []
+    if lines is not None:
+        # Depending on the OpenCV version the shape is (N, 1, 4) or (N, 4)
+        for x1, y1, x2, y2 in lines.reshape(-1, 4):
+            angle = np.degrees(np.arctan2(y1 - y2, x1 - x2))
+            # Endpoint order is arbitrary: normalize to (-180, 0] (vertical = -90)
+            angle = (angle % 180) - 180 if angle % 180 != 0 else 0.0
+            angles.append(angle)
+    stripeAngle = float(np.median(angles)) if angles else -90.0
+    rgbImg = rotateImage(rgbImg, stripeAngle + 90)
+    results.append({"title": "Rotated Image (Hough)", "image": rgbImg.copy(),
+                    "text": [f"Detected lines: {len(angles)}",
+                             f"Rotation applied: {stripeAngle + 90:.4f}°"]})
+    prog(5)
+
     # Exit pupil given by the user: the circle inscribed in the square crop (its center
     # is the crop center, which the rotations about the crop center do not move)
     hC, wC = bgrImg.shape[:2]
     cropCircle = ((wC - 1) / 2.0, (hC - 1) / 2.0, min(wC, hC) / 2.0) if pupilFromCrop else None
-    houghRotation, nHough, houghMethod = stripeOrientation(rgbImg, cropCircle)
-    stripeAngle = houghRotation - 90.0
-    rgbOrig = rgbImg.copy()          # every later transformation starts from the original
-    rgbImg = rotateImage(rgbOrig, stripeAngle + 90)
-    results.append({"title": "Rotated Image (Hough)", "image": rgbImg.copy(),
-                    "text": [f"Detected lines: {nHough}",
-                             f"Orientation from: {houghMethod}",
-                             f"Rotation applied: {stripeAngle + 90:.4f}°"]})
-    prog(5)
 
     # ── Vertical alignment verification (central stripes) ──
-    rgbImg, alignVis, alignText, alignCorrection = verifyVerticalAlignment(
-        rgbOrig, stripeAngle + 90, cropCircle)
+    rgbImg, alignVis, alignText, alignCorrection = verifyVerticalAlignment(rgbImg, cropCircle)
     results.append({"title": "Vertical Alignment Verification", "image": alignVis,
                     "text": alignText})
     prog(9)
@@ -2098,12 +1398,11 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
         pupilSource = "automatic detection (no crop)"
     side = int(2 * np.ceil(rP * PUPIL_MARGIN))
     c0 = (side - 1) / 2.0
+    T = np.float32([[1, 0, c0 - cx], [0, 1, c0 - cy]])
     cropToWork = np.vstack([Rtot, [0, 0, 1]])
     cropToWork[0, 2] += c0 - cx
     cropToWork[1, 2] += c0 - cy
-    # A single resampling of the original crop: rotation (Hough + verticality) and
-    # centering of the pupil in one affine transformation
-    rgbImg = cv2.warpAffine(rgbOrig, cropToWork[:2], (side, side), flags=cv2.INTER_LANCZOS4,
+    rgbImg = cv2.warpAffine(rgbImg, T, (side, side), flags=cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_CONSTANT)
     pupil = (c0, c0, rP)
     vis = rgbImg.copy()
@@ -2151,7 +1450,7 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
     stripesH = [{"peak": s_["peak"], "anchors": [(side - 1 - r_, c_) for (r_, c_) in s_["anchors"]]}
                 for s_ in V["stripes"]]
     H = analyzeRonchigram(rgbH, pupil, "Horizontal", True, results, prog, 40, 68, mapping,
-                          stripesOverride=stripesH, maxDegree=V["maxDegree"])
+                          stripesOverride=stripesH)
 
     # ── Grid ──
     stageStart["D"] = len(results)
@@ -2247,8 +1546,7 @@ def processImg(route, progressCb=None, nZernike=None, surface=None, fringeEditor
         "data": {"pointClouds": ref2, "matrices": matrices, "pupil": pupil,
                  "original": {"Vertical": V["df"], "Horizontal": H["df"], "Grid": G}},
         "text": [f"Matrix size: {shape[0]} x {shape[1]} (float64, NaN = no data)",
-                 "Positions = points on the " + ("experimental fringes" if TA_POSITION ==
-                                                 "experimental" else "theoretical lines"),
+                 "Positions = theoretical points",
                  "Values = adjusted differences (min = 0)",
                  "Download: Excel (3 sheets) + .npz with the 3 matrices"]})
     prog(93)
@@ -2754,7 +2052,7 @@ def feRefreshList():
         tk.Button(row, text=f"Fringe {i + 1}  ·  {n} points{warn}", anchor="w",
                   command=lambda i=i: feSelect(i), relief="flat", bd=0, cursor="hand2",
                   bg=GOLD if sel else "#EEF3F9", fg=TEXT,
-                  font=(FONT, 10, "bold" if sel else "normal"), padx=8, pady=2
+                  font=(FONT, 10, "bold" if sel else "normal"), padx=8, pady=4
                   ).pack(side="left", fill="x", expand=True, padx=(4, 0))
     nOk = sum(1 for a in fe["stripes"] if len(a) >= MIN_MANUAL_ANCHORS)
     feInfo.config(text=f"Detected automatically: {fe['nAuto']}   ·   Now: {len(fe['stripes'])} "
@@ -3855,32 +3153,28 @@ tk.Label(feCtrl, text="Select a fringe and click on the image to add anchor poin
                       "anchor points after you confirm.",
          bg=WHITE, fg=MUTED, font=(FONT, 9, "italic"), wraplength=S(310),
          justify="left").pack(fill="x", pady=(0, 8))
-# The action buttons are packed first at the bottom so they are always visible; the
-# list of fringes takes the remaining space above them
-feBottom = tk.Frame(feCtrl, bg=WHITE)
-feBottom.pack(side="bottom", fill="x")
 feList = tk.Frame(feCtrl, bg=WHITE)
-feList.pack(side="top", fill="x", pady=(0, 6))
-rowFe1 = tk.Frame(feBottom, bg=WHITE)
-rowFe1.pack(fill="x", pady=(0, 5))
-makeButton(rowFe1, "+  New fringe", feNewFringe, NAVY, size=10, padx=8, pady=4
+feList.pack(fill="x", pady=(0, 8))
+rowFe1 = tk.Frame(feCtrl, bg=WHITE)
+rowFe1.pack(fill="x", pady=(0, 6))
+makeButton(rowFe1, "+  New fringe", feNewFringe, NAVY, size=10, padx=8, pady=5
            ).pack(side="left", fill="x", expand=True, padx=(0, 6))
-makeButton(rowFe1, "Delete fringe", feDeleteFringe, "#A94442", size=10, padx=8, pady=4
+makeButton(rowFe1, "Delete fringe", feDeleteFringe, "#A94442", size=10, padx=8, pady=5
            ).pack(side="left", fill="x", expand=True)
-rowFe2 = tk.Frame(feBottom, bg=WHITE)
-rowFe2.pack(fill="x", pady=(0, 5))
+rowFe2 = tk.Frame(feCtrl, bg=WHITE)
+rowFe2.pack(fill="x", pady=(0, 6))
 makeButton(rowFe2, "Clear points", feClearPoints, "#DDE3EB", fg=TEXT, size=10, bold=False,
-           padx=8, pady=4).pack(side="left", fill="x", expand=True, padx=(0, 6))
+           padx=8, pady=5).pack(side="left", fill="x", expand=True, padx=(0, 6))
 makeButton(rowFe2, "Delete all", feDeleteAll, "#DDE3EB", fg=TEXT, size=10, bold=False,
-           padx=8, pady=4).pack(side="left", fill="x", expand=True)
-makeButton(feBottom, "Reset to automatic detection", feReset, "#DDE3EB", fg=TEXT, size=10,
-           bold=False, padx=8, pady=4).pack(fill="x", pady=(0, 6))
-feInfo = tk.Label(feBottom, text="", bg=WHITE, fg=TEXT, font=(FONT, 9), wraplength=S(310),
+           padx=8, pady=5).pack(side="left", fill="x", expand=True)
+makeButton(feCtrl, "Reset to automatic detection", feReset, "#DDE3EB", fg=TEXT, size=10,
+           bold=False, padx=8, pady=5).pack(fill="x", pady=(0, 8))
+feInfo = tk.Label(feCtrl, text="", bg=WHITE, fg=TEXT, font=(FONT, 9), wraplength=S(310),
                   justify="left", anchor="w")
-feInfo.pack(fill="x", pady=(0, 6))
-makeButton(feBottom, "✓  Confirm fringes and continue", feConfirm, GREEN_BTN, size=12,
-           pady=8).pack(fill="x", pady=(0, 5))
-makeButton(feBottom, "Cancel", feCancel, "#9E9E9E", size=10, pady=4).pack(fill="x")
+feInfo.pack(fill="x", pady=(0, 10))
+makeButton(feCtrl, "✓  Confirm fringes and continue", feConfirm, GREEN_BTN, size=12,
+           pady=9).pack(fill="x", pady=(0, 6))
+makeButton(feCtrl, "Cancel", feCancel, "#9E9E9E", size=10, pady=5).pack(fill="x")
 
 # ══ RESULTS VIEW ══
 viewResults = tk.Frame(frameBody, bg=BG)
